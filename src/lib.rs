@@ -298,21 +298,25 @@ fn text_blocks(content: &serde_json::Value, accepted_types: &[&str]) -> Option<S
     normalized_text(&text)
 }
 
-fn finish_session(
+struct SessionHeader {
     provider: Provider,
     id: String,
     title: Option<String>,
     directory: Option<PathBuf>,
     updated_at: i64,
+}
+
+fn finish_session(
+    header: SessionHeader,
     user_messages: Vec<String>,
     assistant_messages: Vec<String>,
 ) -> Option<Session> {
     Some(Session {
-        provider,
-        id,
-        title: title.and_then(|value| normalized_text(&value)),
-        directory,
-        updated_at,
+        provider: header.provider,
+        id: header.id,
+        title: header.title.and_then(|value| normalized_text(&value)),
+        directory: header.directory,
+        updated_at: header.updated_at,
         first_user_message: user_messages.first()?.clone(),
         last_user_message: user_messages.last()?.clone(),
         last_assistant_message: assistant_messages.last().cloned(),

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
-use session_search::{
+use sfind::{
     discover_sessions, fork_session, fork_session_command, resume_session, session_command,
     Session, SessionRoots,
 };
@@ -13,7 +13,7 @@ use tracing::warn;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "session-search",
+    name = "sfind",
     version,
     about = "Find and resume Codex, OpenCode, and Claude Code sessions"
 )]

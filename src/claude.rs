@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::{finish_session, text_blocks, timestamp_millis, Provider, Session};
+use crate::{finish_session, text_blocks, timestamp_millis, Provider, Session, SessionHeader};
 
 pub(crate) fn load(root: &Path) -> Result<Vec<Session>> {
     if !root.exists() {
@@ -81,11 +81,13 @@ fn parse(path: &Path) -> Result<Option<Session>> {
     }
     Ok(id.and_then(|id| {
         finish_session(
-            Provider::Claude,
-            id,
-            title,
-            directory,
-            updated_at,
+            SessionHeader {
+                provider: Provider::Claude,
+                id,
+                title,
+                directory,
+                updated_at,
+            },
             user_messages,
             assistant_messages,
         )

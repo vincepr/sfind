@@ -18,28 +18,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use session_search::Session;
+use sfind::{Provider, Session};
 
 const STACKED_DETAIL_TEXT_MAX_CHARS: usize = 360;
 const STACKED_DETAIL_TITLE_MAX_CHARS: usize = 90;
 const HORIZONTAL_LAYOUT_MIN_WIDTH: u16 = 110;
 const LIST_ITEM_HEIGHT: usize = 2;
-const RANGE_FILTER_WIDTH: u16 = 36;
+const RANGE_FILTER_WIDTH: u16 = 12;
+const PROVIDER_FILTER_WIDTH: u16 = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DayRange {
     All,
     Days(u8),
 }
-
-const DAY_RANGES: [(DayRange, &str); 6] = [
-    (DayRange::All, "All"),
-    (DayRange::Days(1), "Today"),
-    (DayRange::Days(2), "2d"),
-    (DayRange::Days(3), "3d"),
-    (DayRange::Days(7), "7d"),
-    (DayRange::Days(30), "30d"),
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Selection {
@@ -70,7 +62,7 @@ pub(crate) fn pick(sessions: &[Session], warning_count: usize) -> Result<Option<
         terminal
             .terminal
             .draw(|frame| app.draw(frame))
-            .context("could not draw session search")?;
+            .context("could not draw sfind")?;
         if !event::poll(Duration::from_millis(250)).context("could not poll terminal input")? {
             continue;
         }
@@ -134,9 +126,11 @@ struct App<'a> {
     list_inner: Rect,
     detail_inner: Rect,
     range_inner: Rect,
+    provider_inner: Rect,
     detail_scroll: u16,
     fork_mode: bool,
     day_range: DayRange,
+    provider_filter: Option<Provider>,
     warning_count: usize,
 }
 
@@ -165,9 +159,11 @@ impl<'a> App<'a> {
             list_inner: Rect::default(),
             detail_inner: Rect::default(),
             range_inner: Rect::default(),
+            provider_inner: Rect::default(),
             detail_scroll: 0,
             fork_mode: false,
             day_range: DayRange::All,
+            provider_filter: None,
             warning_count,
         }
     }
@@ -183,7 +179,11 @@ impl<'a> App<'a> {
             .split(frame.area());
         let top = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(RANGE_FILTER_WIDTH)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(RANGE_FILTER_WIDTH),
+                Constraint::Length(PROVIDER_FILTER_WIDTH),
+            ])
             .split(sections[0]);
         let search = Paragraph::new(format!("> {}", self.query)).block(
             Block::default()
@@ -194,8 +194,29 @@ impl<'a> App<'a> {
         let range_block = Block::default().borders(Borders::ALL).title(" Range ");
         self.range_inner = range_block.inner(top[1]);
         frame.render_widget(
-            Paragraph::new(day_range_line(self.day_range)).block(range_block),
+            Paragraph::new(Line::styled(
+                padded_label(day_range_label(self.day_range), self.range_inner.width),
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .block(range_block),
             top[1],
+        );
+        let provider_block = Block::default().borders(Borders::ALL).title(" CLI ");
+        self.provider_inner = provider_block.inner(top[2]);
+        let provider = self.provider_filter.map_or("All", provider_short_label);
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                padded_label(provider, self.provider_inner.width),
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .block(provider_block),
+            top[2],
         );
 
         let pane_direction = pane_direction(sections[1].width);
@@ -385,13 +406,18 @@ impl<'a> App<'a> {
     fn mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::Down(_)
+                if self
+                    .provider_inner
+                    .contains((mouse.column, mouse.row).into()) =>
+            {
+                self.provider_filter = next_provider_filter(self.provider_filter);
+                self.filter();
+            }
+            MouseEventKind::Down(_)
                 if self.range_inner.contains((mouse.column, mouse.row).into()) =>
             {
-                let column = mouse.column.saturating_sub(self.range_inner.x);
-                if let Some(range) = day_range_at_column(column) {
-                    self.day_range = range;
-                    self.filter();
-                }
+                self.day_range = next_day_range(self.day_range);
+                self.filter();
             }
             MouseEventKind::ScrollUp
                 if self.detail_inner.contains((mouse.column, mouse.row).into()) =>
@@ -438,6 +464,12 @@ impl<'a> App<'a> {
                 if cutoff.is_some_and(|cutoff| self.sessions[index].updated_at < cutoff) {
                     return None;
                 }
+                if self
+                    .provider_filter
+                    .is_some_and(|provider| self.sessions[index].provider != provider)
+                {
+                    return None;
+                }
                 search_rank(text, path, &query).map(|rank| (rank, index))
             })
             .collect::<Vec<_>>();
@@ -482,38 +514,25 @@ impl<'a> App<'a> {
     }
 }
 
-fn day_range_line(selected: DayRange) -> Line<'static> {
-    let mut spans = Vec::with_capacity(DAY_RANGES.len() * 2 - 1);
-    for (index, (range, label)) in DAY_RANGES.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let style = if *range == selected {
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(format!(" {label} "), style));
+fn next_day_range(current: DayRange) -> DayRange {
+    match current {
+        DayRange::All => DayRange::Days(1),
+        DayRange::Days(1) => DayRange::Days(3),
+        DayRange::Days(3) => DayRange::Days(7),
+        DayRange::Days(7) => DayRange::Days(30),
+        DayRange::Days(30) | DayRange::Days(_) => DayRange::All,
     }
-    Line::from(spans)
 }
 
-fn day_range_at_column(column: u16) -> Option<DayRange> {
-    let mut start = 0_u16;
-    for (index, (range, label)) in DAY_RANGES.iter().enumerate() {
-        if index > 0 {
-            start = start.saturating_add(1);
-        }
-        let end = start.saturating_add(label.len() as u16 + 2);
-        if (start..end).contains(&column) {
-            return Some(*range);
-        }
-        start = end;
+fn day_range_label(range: DayRange) -> &'static str {
+    match range {
+        DayRange::All => "All",
+        DayRange::Days(1) => "Today",
+        DayRange::Days(3) => "3d",
+        DayRange::Days(7) => "7d",
+        DayRange::Days(30) => "30d",
+        DayRange::Days(_) => "All",
     }
-    None
 }
 
 fn day_range_cutoff(range: DayRange, now: DateTime<Local>) -> Option<i64> {
@@ -528,6 +547,33 @@ fn day_range_cutoff(range: DayRange, now: DateTime<Local>) -> Option<i64> {
         .from_local_datetime(&midnight)
         .earliest()
         .map(|date| date.timestamp_millis())
+}
+
+fn next_provider_filter(current: Option<Provider>) -> Option<Provider> {
+    match current {
+        None => Some(Provider::Codex),
+        Some(Provider::Codex) => Some(Provider::OpenCode),
+        Some(Provider::OpenCode) => Some(Provider::Claude),
+        Some(Provider::Claude) => None,
+    }
+}
+
+fn provider_short_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Codex => "codex",
+        Provider::OpenCode => "open",
+        Provider::Claude => "claude",
+    }
+}
+
+fn padded_label(label: &str, width: u16) -> String {
+    let width = usize::from(width);
+    let label = truncate(label, width);
+    let label_width = label.chars().count();
+    let remaining = width.saturating_sub(label_width);
+    let left = remaining / 2;
+    let right = remaining - left;
+    format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
 }
 
 fn pane_direction(width: u16) -> Direction {
@@ -631,13 +677,16 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
                 .map_or_else(|| "not provided".to_owned(), |path| compact_path(path, 3)),
         ),
         Line::raw(""),
-        label("First sent message"),
+        label("First user message", Color::LightBlue),
         Line::raw(truncate(&session.first_user_message, text_max_chars)),
         Line::raw(""),
-        label("Last sent message"),
+        label("Last user message", Color::LightBlue),
         Line::raw(truncate(&session.last_user_message, text_max_chars)),
         Line::raw(""),
-        label("Last received message"),
+        label(
+            &format!("Last {} message", provider_short_label(session.provider)),
+            provider_color(session.provider.label()),
+        ),
         Line::raw(truncate_middle(
             session
                 .last_assistant_message
@@ -682,12 +731,10 @@ fn field(label: &str, value: &str) -> Line<'static> {
     ])
 }
 
-fn label(value: &str) -> Line<'static> {
+fn label(value: &str, color: Color) -> Line<'static> {
     Line::styled(
         format!("{value}:"),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
 }
 
@@ -778,12 +825,13 @@ mod tests {
     use chrono::{Local, TimeZone};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
-    use session_search::{Provider, Session};
+    use sfind::{Provider, Session};
 
     use super::{
-        compact_path, day_range_at_column, day_range_cutoff, delete_last_word, detail_cutoffs,
+        compact_path, day_range_cutoff, day_range_label, delete_last_word, detail_cutoffs,
         directory_color, fuzzy_match, list_item_capacity, list_title_capacity, list_viewport,
-        pane_direction, search_rank, truncate, truncate_middle, App, DayRange, Selection,
+        next_day_range, next_provider_filter, padded_label, pane_direction, provider_short_label,
+        search_rank, truncate, truncate_middle, App, DayRange, Selection,
     };
 
     #[test]
@@ -802,24 +850,39 @@ mod tests {
     fn directory_matches_rank_above_message_matches() {
         assert_eq!(
             search_rank(
-                "unrelated message /home/vince/code/session-search",
-                "/home/vince/code/session-search",
-                "session-sea"
+                "unrelated message /home/vince/code/sfind",
+                "/home/vince/code/sfind",
+                "sfind"
             ),
             Some(3)
         );
-        assert_eq!(
-            search_rank("discuss session search behavior", "", "session search"),
-            Some(1)
-        );
+        assert_eq!(search_rank("discuss sfind behavior", "", "sfind"), Some(1));
     }
 
     #[test]
-    fn range_filter_hitboxes_match_visible_labels() {
-        assert_eq!(day_range_at_column(0), Some(DayRange::All));
-        assert_eq!(day_range_at_column(6), Some(DayRange::Days(1)));
-        assert_eq!(day_range_at_column(14), Some(DayRange::Days(2)));
-        assert_eq!(day_range_at_column(5), None);
+    fn range_filter_cycles_through_each_period() {
+        let mut range = DayRange::All;
+        let expected = [
+            (DayRange::Days(1), "Today"),
+            (DayRange::Days(3), "3d"),
+            (DayRange::Days(7), "7d"),
+            (DayRange::Days(30), "30d"),
+            (DayRange::All, "All"),
+        ];
+
+        for (next, label) in expected {
+            range = next_day_range(range);
+            assert_eq!(range, next);
+            assert_eq!(day_range_label(range), label);
+        }
+    }
+
+    #[test]
+    fn short_filter_labels_fill_their_button_width() {
+        let label = padded_label("open", 12);
+
+        assert_eq!(label.chars().count(), 12);
+        assert_eq!(label.trim(), "open");
     }
 
     #[test]
@@ -829,13 +892,53 @@ mod tests {
             .single()
             .expect("unambiguous local test time");
         let expected = Local
-            .with_ymd_and_hms(2026, 7, 17, 0, 0, 0)
+            .with_ymd_and_hms(2026, 7, 16, 0, 0, 0)
             .earliest()
             .expect("local midnight")
             .timestamp_millis();
 
         assert_eq!(day_range_cutoff(DayRange::All, now), None);
-        assert_eq!(day_range_cutoff(DayRange::Days(2), now), Some(expected));
+        assert_eq!(day_range_cutoff(DayRange::Days(3), now), Some(expected));
+    }
+
+    #[test]
+    fn provider_filter_cycles_through_each_cli() {
+        assert_eq!(next_provider_filter(None), Some(Provider::Codex));
+        assert_eq!(
+            next_provider_filter(Some(Provider::Codex)),
+            Some(Provider::OpenCode)
+        );
+        assert_eq!(
+            next_provider_filter(Some(Provider::OpenCode)),
+            Some(Provider::Claude)
+        );
+        assert_eq!(next_provider_filter(Some(Provider::Claude)), None);
+        assert_eq!(provider_short_label(Provider::OpenCode), "open");
+    }
+
+    #[test]
+    fn selected_provider_filters_sessions() {
+        let session = |id: &str, provider: Provider| Session {
+            provider,
+            id: id.to_owned(),
+            title: None,
+            directory: None,
+            updated_at: 0,
+            first_user_message: "message".to_owned(),
+            last_user_message: "message".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["message".to_owned()],
+        };
+        let sessions = [
+            session("a", Provider::Codex),
+            session("b", Provider::Claude),
+        ];
+        let mut app = App::new(&sessions, 0);
+        app.provider_filter = Some(Provider::Claude);
+
+        app.filter();
+
+        assert_eq!(app.visible, [1]);
     }
 
     #[test]
@@ -939,8 +1042,8 @@ mod tests {
     #[test]
     fn long_directories_show_only_the_last_three_parts() {
         assert_eq!(
-            compact_path(Path::new("/home/vince/code/session-search"), 3),
-            ".../vince/code/session-search"
+            compact_path(Path::new("/home/vince/code/sfind"), 3),
+            ".../vince/code/sfind"
         );
         assert_eq!(compact_path(Path::new("code/project"), 3), "code/project");
     }

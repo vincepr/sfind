@@ -963,7 +963,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "session-search"
+name = "sfind"
 version = "0.1.0"
 dependencies = [
  "anyhow",

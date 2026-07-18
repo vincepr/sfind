@@ -2,7 +2,7 @@ use assert_cmd::Command;
 
 #[test]
 fn help_describes_providers_and_plain_listing() {
-    let mut command = Command::cargo_bin("session-search").unwrap();
+    let mut command = Command::cargo_bin("sfind").unwrap();
     command
         .arg("--help")
         .assert()
@@ -18,10 +18,10 @@ fn help_describes_providers_and_plain_listing() {
 
 #[test]
 fn version_prints_package_version() {
-    let mut command = Command::cargo_bin("session-search").unwrap();
+    let mut command = Command::cargo_bin("sfind").unwrap();
     command
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicates::str::contains("session-search 0.1.0"));
+        .stdout(predicates::str::contains("sfind 0.1.0"));
 }

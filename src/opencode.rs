@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use crate::{finish_session, normalized_text, Provider, Session};
+use crate::{finish_session, normalized_text, Provider, Session, SessionHeader};
 
 #[derive(Debug)]
 struct OpenCodeSession {
@@ -95,11 +95,13 @@ fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) 
         return;
     };
     if let Some(session) = finish_session(
-        Provider::OpenCode,
-        session.id,
-        Some(session.title),
-        Some(session.directory),
-        session.updated_at,
+        SessionHeader {
+            provider: Provider::OpenCode,
+            id: session.id,
+            title: Some(session.title),
+            directory: Some(session.directory),
+            updated_at: session.updated_at,
+        },
         session.user_messages,
         session.assistant_messages,
     ) {

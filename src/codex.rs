@@ -8,7 +8,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::{finish_session, text_blocks, timestamp_millis, Provider, Session};
+use crate::{finish_session, text_blocks, timestamp_millis, Provider, Session, SessionHeader};
 
 pub(crate) fn load(home: &Path) -> Result<Vec<Session>> {
     let root = home.join("sessions");
@@ -122,11 +122,13 @@ fn parse(path: &Path) -> Result<Option<Session>> {
     let id = id.or_else(|| id_from_filename(path));
     Ok(id.and_then(|id| {
         finish_session(
-            Provider::Codex,
-            id,
-            title,
-            directory,
-            updated_at,
+            SessionHeader {
+                provider: Provider::Codex,
+                id,
+                title,
+                directory,
+                updated_at,
+            },
             user_messages,
             assistant_messages,
         )

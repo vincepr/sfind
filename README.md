@@ -1,4 +1,4 @@
-# session-search
+# sfind
 
 Local fuzzy finder for Codex, OpenCode, and Claude Code sessions.
 
@@ -14,8 +14,9 @@ with the arrow keys or mouse, inspect the first and latest sent
 messages and latest received message, then press Enter to resume the session in its owning CLI.
 On narrow terminals, the session list is placed above the details instead of beside it.
 
-Use the clickable range control in the top-right to show all sessions, today, or the last 2, 3, 7,
-or 30 local calendar days. `All` is selected by default.
+Use the range button in the top-right to cycle through all sessions, today, or the last 3, 7, or
+30 local calendar days. `All` is selected by default. The CLI button beside it cycles through all
+providers, Codex, OpenCode (`open`), and Claude.
 
 Press `Ctrl-P` to close the finder and print a safely quoted command that changes to the project
 directory and resumes the selected session. The command is printed but not executed. Press
@@ -38,7 +39,7 @@ cargo run -- --list
 
 ```bash
 cargo install --path .
-session-search
+sfind
 ```
 
 Provider locations default to `$CODEX_HOME` or `~/.codex`, `$OPENCODE_DATA_DIR` or the operating
