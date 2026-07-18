@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use crate::{
     finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
-    SessionHeader,
+    SessionHeader, SessionUsage, TokenUsage,
 };
 
 pub(crate) fn load(home: &Path) -> Result<ProviderDiscovery> {
@@ -113,6 +113,9 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
     let mut last_assistant_message = None;
     let mut fallback_users = Vec::new();
     let mut fallback_assistant_message = None;
+    let mut model = None;
+    let mut usage = SessionUsage::default();
+    let mut previous_total_usage = TokenUsage::default();
 
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.with_context(|| format!("could not read {}", path.display()))?;
@@ -150,6 +153,9 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
                         .map(str::to_owned);
                 }
             }
+            Some("turn_context") => {
+                model = usage_model(payload).map(str::to_owned).or(model);
+            }
             Some("response_item")
                 if payload.get("type").and_then(Value::as_str) == Some("message") =>
             {
@@ -165,6 +171,25 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
                 }
             }
             Some("event_msg") => {
+                if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+                    let info = payload.get("info").unwrap_or(payload);
+                    let current_total = info.get("total_token_usage").and_then(parse_token_usage);
+                    let event_usage = info
+                        .get("last_token_usage")
+                        .and_then(parse_token_usage)
+                        .or_else(|| {
+                            current_total.map(|total| total.saturating_sub(previous_total_usage))
+                        });
+                    if let Some(total) = current_total {
+                        previous_total_usage = total;
+                    }
+                    if let Some(event_usage) = event_usage {
+                        let event_model = usage_model(payload)
+                            .or_else(|| usage_model(info))
+                            .or(model.as_deref());
+                        usage.add(event_model, event_usage, None);
+                    }
+                }
                 let message = payload
                     .get("message")
                     .and_then(Value::as_str)
@@ -196,8 +221,46 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
             },
             user_messages,
             last_assistant_message,
+            usage,
         )
     }))
+}
+
+fn usage_model(value: &Value) -> Option<&str> {
+    value
+        .get("model")
+        .or_else(|| value.get("model_name"))
+        .or_else(|| {
+            value
+                .get("metadata")
+                .and_then(|metadata| metadata.get("model"))
+        })
+        .and_then(Value::as_str)
+}
+
+fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
+    let input = token_count(value, &["input_tokens", "prompt_tokens"]);
+    let cached = token_count(value, &["cached_input_tokens", "cached_tokens"]).min(input);
+    let cache_creation = token_count(
+        value,
+        &["cache_write_input_tokens", "cache_creation_input_tokens"],
+    )
+    .min(input.saturating_sub(cached));
+    let usage = TokenUsage {
+        input_tokens: input.saturating_sub(cached).saturating_sub(cache_creation),
+        output_tokens: token_count(value, &["output_tokens", "completion_tokens"]),
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cached,
+        reasoning_tokens: token_count(value, &["reasoning_output_tokens", "reasoning_tokens"]),
+    };
+    (!usage.is_empty()).then_some(usage)
+}
+
+fn token_count(value: &Value, names: &[&str]) -> u64 {
+    names
+        .iter()
+        .find_map(|name| value.get(name).and_then(Value::as_u64))
+        .unwrap_or_default()
 }
 
 fn is_injected_user_message(message: &str) -> bool {
@@ -246,6 +309,12 @@ mod tests {
                 r#"{"timestamp":"2026-01-01T10:02:00Z","type":"response_item","payload":{"type":"function_call","arguments":"secret tool text"}}"#,
                 "\n",
                 r#"{"timestamp":"2026-01-01T10:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The login flow is fixed."}]}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_creation_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":5},"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_creation_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":5}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":80,"cache_creation_input_tokens":15,"output_tokens":30,"reasoning_output_tokens":8}}}}"#,
                 "\n"
             ),
         )
@@ -258,6 +327,14 @@ mod tests {
         assert_eq!(sessions[0].id, "codex-1");
         assert_eq!(sessions[0].title.as_deref(), Some("Auth cleanup"));
         assert_eq!(sessions[0].user_messages, ["Fix the login flow"]);
+        assert_eq!(sessions[0].usage.models.len(), 1);
+        assert_eq!(sessions[0].usage.models[0].model, "gpt-5.6-sol");
+        assert_eq!(sessions[0].usage.models[0].tokens.input_tokens, 55);
+        assert_eq!(sessions[0].usage.models[0].tokens.cache_creation_tokens, 15);
+        assert_eq!(sessions[0].usage.models[0].tokens.cache_read_tokens, 80);
+        assert_eq!(sessions[0].usage.models[0].tokens.output_tokens, 30);
+        assert_eq!(sessions[0].usage.models[0].tokens.reasoning_tokens, 8);
+        assert_eq!(sessions[0].usage.models[0].recorded_cost_microusd, None);
         assert!(!sessions[0].search_text().contains("secret tool text"));
         assert!(!sessions[0].search_text().contains("private metadata"));
     }
