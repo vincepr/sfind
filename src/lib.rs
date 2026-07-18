@@ -21,6 +21,128 @@ pub enum Provider {
     Claude,
 }
 
+/// Provider-independent token counters for one model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TokenUsage {
+    /// Non-cached input tokens.
+    pub input_tokens: u64,
+    /// Output tokens.
+    pub output_tokens: u64,
+    /// Tokens written to a provider cache.
+    pub cache_creation_tokens: u64,
+    /// Tokens read from a provider cache.
+    pub cache_read_tokens: u64,
+    /// Reasoning tokens reported separately by the provider.
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Returns the token total used by the usage views.
+    #[must_use]
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// Returns whether every displayed token counter is zero.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.reasoning_tokens == 0
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(other.cache_creation_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
+
+    fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_sub(previous.cache_creation_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(previous.cache_read_tokens),
+            reasoning_tokens: self
+                .reasoning_tokens
+                .saturating_sub(previous.reasoning_tokens),
+        }
+    }
+}
+
+/// Token usage attributed to one model within a session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelUsage {
+    /// Provider model identifier, or `unknown` when it was not recorded.
+    pub model: String,
+    /// Normalized token counters.
+    pub tokens: TokenUsage,
+    /// Provider-recorded cost in millionths of a US dollar.
+    pub recorded_cost_microusd: Option<u64>,
+}
+
+/// Usage collected while a provider session is discovered.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionUsage {
+    /// Per-model usage in first-seen order.
+    pub models: Vec<ModelUsage>,
+}
+
+impl SessionUsage {
+    /// Adds normalized provider usage to the corresponding model.
+    pub fn add(
+        &mut self,
+        model: Option<&str>,
+        tokens: TokenUsage,
+        recorded_cost_microusd: Option<u64>,
+    ) {
+        if tokens.is_empty() && recorded_cost_microusd.is_none() {
+            return;
+        }
+        let model = model.filter(|model| !model.is_empty()).unwrap_or("unknown");
+        if let Some(existing) = self.models.iter_mut().find(|usage| usage.model == model) {
+            existing.tokens.add_assign(tokens);
+            existing.recorded_cost_microusd =
+                match (existing.recorded_cost_microusd, recorded_cost_microusd) {
+                    (Some(existing), Some(added)) => existing.checked_add(added),
+                    (None, _) | (_, None) => None,
+                };
+            return;
+        }
+        self.models.push(ModelUsage {
+            model: model.to_owned(),
+            tokens,
+            recorded_cost_microusd,
+        });
+    }
+
+    /// Returns all token counters combined across models.
+    #[must_use]
+    pub fn total(&self) -> TokenUsage {
+        self.models
+            .iter()
+            .fold(TokenUsage::default(), |mut total, usage| {
+                total.add_assign(usage.tokens);
+                total
+            })
+    }
+}
+
 impl Provider {
     /// Returns the short provider label displayed by the finder.
     #[must_use]
@@ -54,6 +176,8 @@ pub struct Session {
     pub last_assistant_message: Option<String>,
     /// All user-authored messages; this is the only message content searched.
     pub user_messages: Vec<String>,
+    /// Token usage and provider-recorded cost grouped by model.
+    pub usage: SessionUsage,
 }
 
 impl Session {
@@ -362,6 +486,7 @@ fn finish_session(
     header: SessionHeader,
     user_messages: Vec<String>,
     last_assistant_message: Option<String>,
+    usage: SessionUsage,
 ) -> Option<Session> {
     Some(Session {
         provider: header.provider,
@@ -373,6 +498,7 @@ fn finish_session(
         last_user_message: user_messages.last()?.clone(),
         last_assistant_message,
         user_messages,
+        usage,
     })
 }
 
@@ -383,7 +509,9 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
 
-    use super::{fork_session_command, session_command, session_process, Provider, Session};
+    use super::{
+        fork_session_command, session_command, session_process, Provider, Session, SessionUsage,
+    };
 
     #[test]
     fn builds_each_providers_resume_command() {
@@ -406,6 +534,7 @@ mod tests {
                 last_user_message: "last".to_owned(),
                 last_assistant_message: None,
                 user_messages: vec!["first".to_owned(), "last".to_owned()],
+                usage: SessionUsage::default(),
             };
 
             let command = session_process(&session, false);
@@ -427,6 +556,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned(), "last".to_owned()],
+            usage: SessionUsage::default(),
         };
 
         let command = session_process(&session, false);
@@ -450,6 +580,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: SessionUsage::default(),
         };
 
         let command = session_command(&session);
@@ -477,6 +608,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: SessionUsage::default(),
         };
 
         assert_eq!(
@@ -510,6 +642,7 @@ mod tests {
                 last_user_message: "last".to_owned(),
                 last_assistant_message: None,
                 user_messages: vec!["first".to_owned()],
+                usage: SessionUsage::default(),
             };
 
             let command = session_process(&session, true);
@@ -531,6 +664,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: SessionUsage::default(),
         };
 
         assert_eq!(fork_session_command(&session), "codex fork 'session-1'");

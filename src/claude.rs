@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::{
     finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
-    SessionHeader,
+    SessionHeader, SessionUsage, TokenUsage,
 };
 
 pub(crate) fn load(root: &Path) -> Result<ProviderDiscovery> {
@@ -54,6 +54,8 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
     let mut updated_at = 0;
     let mut user_messages = Vec::new();
     let mut last_assistant_message = None;
+    let mut usage = SessionUsage::default();
+    let mut identified_usage: Vec<(String, Option<String>, TokenUsage)> = Vec::new();
 
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.with_context(|| format!("could not read {}", path.display()))?;
@@ -94,11 +96,33 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
         let text = message
             .get("content")
             .and_then(|content| text_blocks(content, &["text"]));
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some((model, tokens)) = message_usage(message) {
+                if let Some(message_id) = message.get("id").and_then(Value::as_str) {
+                    if let Some((_, existing_model, existing_tokens)) = identified_usage
+                        .iter_mut()
+                        .find(|(id, _, _)| id.as_str() == message_id)
+                    {
+                        if tokens.total_tokens() >= existing_tokens.total_tokens() {
+                            *existing_model = model;
+                            *existing_tokens = tokens;
+                        }
+                    } else {
+                        identified_usage.push((message_id.to_owned(), model, tokens));
+                    }
+                } else {
+                    usage.add(model.as_deref(), tokens, None);
+                }
+            }
+        }
         match (message.get("role").and_then(Value::as_str), text) {
             (Some("user"), Some(text)) => user_messages.push(text),
             (Some("assistant"), Some(text)) => last_assistant_message = Some(text),
             _ => {}
         }
+    }
+    for (_, model, tokens) in identified_usage {
+        usage.add(model.as_deref(), tokens, None);
     }
     Ok(id.and_then(|id| {
         finish_session(
@@ -111,8 +135,30 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
             },
             user_messages,
             last_assistant_message,
+            usage,
         )
     }))
+}
+
+fn message_usage(message: &Value) -> Option<(Option<String>, TokenUsage)> {
+    let tokens = message.get("usage")?;
+    Some((
+        message
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        TokenUsage {
+            input_tokens: token_count(tokens, "input_tokens"),
+            output_tokens: token_count(tokens, "output_tokens"),
+            cache_creation_tokens: token_count(tokens, "cache_creation_input_tokens"),
+            cache_read_tokens: token_count(tokens, "cache_read_input_tokens"),
+            reasoning_tokens: 0,
+        },
+    ))
+}
+
+fn token_count(value: &Value, name: &str) -> u64 {
+    value.get(name).and_then(Value::as_u64).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -137,7 +183,9 @@ mod tests {
                 "\n",
                 r#"{"type":"user","sessionId":"claude-1","timestamp":"2026-01-02T10:02:00Z","message":{"role":"user","content":[{"type":"tool_result","content":"private tool result"}]}}"#,
                 "\n",
-                r#"{"type":"assistant","sessionId":"claude-1","timestamp":"2026-01-02T10:03:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Here is the plan."}]}}"#,
+                r#"{"type":"assistant","sessionId":"claude-1","timestamp":"2026-01-02T10:03:00Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":50},"content":[{"type":"text","text":"Here is the plan."}]}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"claude-1","timestamp":"2026-01-02T10:03:01Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":100,"output_tokens":30,"cache_creation_input_tokens":10,"cache_read_input_tokens":50},"content":[]}}"#,
                 "\nnot json",
                 "\n"
             ),
@@ -150,8 +198,15 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title.as_deref(), Some("Database migration"));
         assert_eq!(sessions[0].user_messages, ["Plan the migration"]);
+        assert_eq!(sessions[0].usage.models.len(), 1);
+        assert_eq!(sessions[0].usage.models[0].model, "claude-opus-4-1");
+        assert_eq!(sessions[0].usage.models[0].tokens.input_tokens, 100);
+        assert_eq!(sessions[0].usage.models[0].tokens.output_tokens, 30);
+        assert_eq!(sessions[0].usage.models[0].tokens.cache_creation_tokens, 10);
+        assert_eq!(sessions[0].usage.models[0].tokens.cache_read_tokens, 50);
+        assert_eq!(sessions[0].usage.models[0].recorded_cost_microusd, None);
         assert!(!sessions[0].search_text().contains("private tool result"));
         assert_eq!(discovery.warnings.len(), 1);
-        assert!(discovery.warnings[0].contains("line 5"));
+        assert!(discovery.warnings[0].contains("line 6"));
     }
 }
