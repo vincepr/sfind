@@ -32,7 +32,10 @@ pub(crate) fn load(root: &Path) -> Result<Vec<Session>> {
 
 fn parse(path: &Path) -> Result<Option<Session>> {
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
-    let mut id = None;
+    let id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned);
     let mut title = None;
     let mut directory = None;
     let mut updated_at = 0;
@@ -55,12 +58,6 @@ fn parse(path: &Path) -> Result<Option<Session>> {
             .and_then(timestamp_millis)
             .unwrap_or(updated_at)
             .max(updated_at);
-        id = id.or_else(|| {
-            value
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
         directory =
             directory.or_else(|| value.get("cwd").and_then(Value::as_str).map(PathBuf::from));
         if value.get("type").and_then(Value::as_str) == Some("summary") {
@@ -82,7 +79,6 @@ fn parse(path: &Path) -> Result<Option<Session>> {
             _ => {}
         }
     }
-    let id = id.or_else(|| path.file_stem()?.to_str().map(str::to_owned));
     Ok(id.and_then(|id| {
         finish_session(
             Provider::Claude,

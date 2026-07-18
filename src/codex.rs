@@ -74,16 +74,18 @@ fn parse(path: &Path) -> Result<Option<Session>> {
         };
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
-                id = payload.get("id").and_then(Value::as_str).map(str::to_owned);
-                directory = payload
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from);
-                title = payload
-                    .get("session_name")
-                    .or_else(|| payload.get("title"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                if id.is_none() {
+                    id = payload.get("id").and_then(Value::as_str).map(str::to_owned);
+                    directory = payload
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from);
+                    title = payload
+                        .get("session_name")
+                        .or_else(|| payload.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
             }
             Some("response_item")
                 if payload.get("type").and_then(Value::as_str) == Some("message") =>
@@ -155,6 +157,8 @@ mod tests {
             concat!(
                 r#"{"timestamp":"2026-01-01T10:00:00Z","type":"session_meta","payload":{"id":"codex-1","cwd":"/work/app","session_name":"Auth cleanup"}}"#,
                 "\n",
+                r#"{"timestamp":"2026-01-01T10:00:01Z","type":"session_meta","payload":{"id":"parent-session","cwd":"/work/old","session_name":"Copied parent"}}"#,
+                "\n",
                 r#"{"timestamp":"2026-01-01T10:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the login flow"}]}}"#,
                 "\n",
                 r#"{"timestamp":"2026-01-01T10:01:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>private metadata</environment_context>"}]}}"#,
@@ -172,6 +176,7 @@ mod tests {
         let sessions = load(root.path()).expect("load sessions");
 
         assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "codex-1");
         assert_eq!(sessions[0].title.as_deref(), Some("Auth cleanup"));
         assert_eq!(sessions[0].user_messages, ["Fix the login flow"]);
         assert!(!sessions[0].search_text().contains("secret tool text"));

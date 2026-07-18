@@ -56,7 +56,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Returns searchable text containing only title/summary and user-authored messages.
+    /// Returns searchable text containing the directory, title, and user-authored messages.
     #[must_use]
     pub fn search_text(&self) -> String {
         let capacity = self.title.as_ref().map_or(0, String::len)
@@ -65,6 +65,10 @@ impl Session {
         let mut text = String::with_capacity(capacity);
         if let Some(title) = &self.title {
             text.push_str(title);
+            text.push('\n');
+        }
+        if let Some(directory) = &self.directory {
+            text.push_str(&directory.to_string_lossy());
             text.push('\n');
         }
         for message in &self.user_messages {
@@ -156,21 +160,86 @@ fn collect(discovery: &mut Discovery, provider: &str, result: Result<Vec<Session
 ///
 /// Returns an error when the provider process cannot be started.
 pub fn resume_session(session: &Session) -> Result<ExitStatus> {
-    resume_command(session)
+    session_process(session, false)
         .status()
         .with_context(|| format!("failed to start {}", session.provider.label()))
 }
 
-fn resume_command(session: &Session) -> Command {
+/// Starts the provider CLI with a new session forked from the selected session.
+///
+/// # Errors
+///
+/// Returns an error when the provider process cannot be started.
+pub fn fork_session(session: &Session) -> Result<ExitStatus> {
+    session_process(session, true)
+        .status()
+        .with_context(|| format!("failed to start {}", session.provider.label()))
+}
+
+/// Returns a Bash-compatible command that changes to the session directory and resumes it.
+///
+/// The returned command is text only and is not executed.
+#[must_use]
+pub fn session_command(session: &Session) -> String {
+    printable_session_command(session, false)
+}
+
+/// Returns a Bash-compatible command that changes directory and forks the session.
+///
+/// The returned command is text only and is not executed.
+#[must_use]
+pub fn fork_session_command(session: &Session) -> String {
+    printable_session_command(session, true)
+}
+
+fn printable_session_command(session: &Session, fork: bool) -> String {
+    let resume = match (session.provider, fork) {
+        (Provider::Codex, false) => format!("codex resume {}", shell_quote(&session.id)),
+        (Provider::Codex, true) => format!("codex fork {}", shell_quote(&session.id)),
+        (Provider::OpenCode, false) => {
+            format!("opencode --session {}", shell_quote(&session.id))
+        }
+        (Provider::OpenCode, true) => {
+            format!("opencode --session {} --fork", shell_quote(&session.id))
+        }
+        (Provider::Claude, false) => format!("claude --resume {}", shell_quote(&session.id)),
+        (Provider::Claude, true) => {
+            format!(
+                "claude --resume {} --fork-session",
+                shell_quote(&session.id)
+            )
+        }
+    };
+    session
+        .directory
+        .as_ref()
+        .map_or(resume.clone(), |directory| {
+            format!(
+                "cd {} && {resume}",
+                shell_quote(&directory.to_string_lossy())
+            )
+        })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn session_process(session: &Session, fork: bool) -> Command {
     let mut command = match session.provider {
         Provider::Codex => {
             let mut command = Command::new("codex");
-            command.arg("resume").arg(&session.id);
+            command
+                .arg(if fork { "fork" } else { "resume" })
+                .arg(&session.id);
             command
         }
         Provider::OpenCode => {
             let mut command = Command::new("opencode");
             command.arg("--session").arg(&session.id);
+            if fork {
+                command.arg("--fork");
+            }
             if let Some(directory) = session.directory.as_ref().filter(|path| path.is_dir()) {
                 command.arg(directory);
             }
@@ -179,6 +248,9 @@ fn resume_command(session: &Session) -> Command {
         Provider::Claude => {
             let mut command = Command::new("claude");
             command.arg("--resume").arg(&session.id);
+            if fork {
+                command.arg("--fork-session");
+            }
             command
         }
     };
@@ -252,7 +324,7 @@ fn finish_session(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{resume_command, Provider, Session};
+    use super::{fork_session_command, session_command, session_process, Provider, Session};
 
     #[test]
     fn builds_each_providers_resume_command() {
@@ -277,7 +349,7 @@ mod tests {
                 user_messages: vec!["first".to_owned(), "last".to_owned()],
             };
 
-            let command = resume_command(&session);
+            let command = session_process(&session, false);
 
             assert_eq!(command.get_program(), program);
             assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
@@ -298,12 +370,85 @@ mod tests {
             user_messages: vec!["first".to_owned(), "last".to_owned()],
         };
 
-        let command = resume_command(&session);
+        let command = session_process(&session, false);
 
         assert!(command.get_current_dir().is_none());
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["--resume", "session-1"]
         );
+    }
+
+    #[test]
+    fn printable_command_changes_directory_without_starting_provider() {
+        let session = Session {
+            provider: Provider::Codex,
+            id: "session'1".to_owned(),
+            title: None,
+            directory: Some(PathBuf::from("/work/project's app")),
+            updated_at: 0,
+            first_user_message: "first".to_owned(),
+            last_user_message: "last".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["first".to_owned()],
+        };
+
+        let command = session_command(&session);
+
+        assert_eq!(
+            command,
+            "cd '/work/project'\"'\"'s app' && codex resume 'session'\"'\"'1'"
+        );
+    }
+
+    #[test]
+    fn builds_each_providers_fork_command() {
+        for (provider, program, arguments) in [
+            (Provider::Codex, "codex", vec!["fork", "session-1"]),
+            (
+                Provider::OpenCode,
+                "opencode",
+                vec!["--session", "session-1", "--fork"],
+            ),
+            (
+                Provider::Claude,
+                "claude",
+                vec!["--resume", "session-1", "--fork-session"],
+            ),
+        ] {
+            let session = Session {
+                provider,
+                id: "session-1".to_owned(),
+                title: None,
+                directory: None,
+                updated_at: 0,
+                first_user_message: "first".to_owned(),
+                last_user_message: "last".to_owned(),
+                last_assistant_message: None,
+                user_messages: vec!["first".to_owned()],
+            };
+
+            let command = session_process(&session, true);
+
+            assert_eq!(command.get_program(), program);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
+        }
+    }
+
+    #[test]
+    fn printable_fork_command_uses_provider_fork_syntax() {
+        let session = Session {
+            provider: Provider::Codex,
+            id: "session-1".to_owned(),
+            title: None,
+            directory: None,
+            updated_at: 0,
+            first_user_message: "first".to_owned(),
+            last_user_message: "last".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["first".to_owned()],
+        };
+
+        assert_eq!(fork_session_command(&session), "codex fork 'session-1'");
     }
 }

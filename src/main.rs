@@ -5,12 +5,16 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
-use session_search::{discover_sessions, resume_session, Session, SessionRoots};
+use session_search::{
+    discover_sessions, fork_session, fork_session_command, resume_session, session_command,
+    Session, SessionRoots,
+};
 use tracing::warn;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "session-search",
+    version,
     about = "Find and resume Codex, OpenCode, and Claude Code sessions"
 )]
 struct Cli {
@@ -56,14 +60,26 @@ fn main() -> Result<()> {
         print_sessions(&discovery.sessions);
         return Ok(());
     }
-    let Some(index) = ui::pick(&discovery.sessions, discovery.warnings.len())? else {
+    let Some(selection) = ui::pick(&discovery.sessions, discovery.warnings.len())? else {
         return Ok(());
     };
+    let index = selection.index();
     let session = discovery
         .sessions
         .get(index)
         .context("selected session disappeared")?;
-    let status = resume_session(session)?;
+    let status = match selection {
+        ui::Selection::Continue(_) => resume_session(session)?,
+        ui::Selection::Fork(_) => fork_session(session)?,
+        ui::Selection::PrintContinueCommand(_) => {
+            println!("{}", session_command(session));
+            return Ok(());
+        }
+        ui::Selection::PrintForkCommand(_) => {
+            println!("{}", fork_session_command(session));
+            return Ok(());
+        }
+    };
     if !status.success() {
         anyhow::bail!("{} exited with status {status}", session.provider.label());
     }

@@ -15,3 +15,13 @@ fn help_describes_providers_and_plain_listing() {
         .stdout(predicates::str::contains("--opencode-data"))
         .stdout(predicates::str::contains("--claude-home"));
 }
+
+#[test]
+fn version_prints_package_version() {
+    let mut command = Command::cargo_bin("session-search").unwrap();
+    command
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("session-search 0.1.0"));
+}
