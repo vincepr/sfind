@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use crate::{finish_session, normalized_text, Provider, Session, SessionHeader};
+use crate::{finish_session, normalized_text, Provider, ProviderDiscovery, Session, SessionHeader};
 
 #[derive(Debug)]
 struct OpenCodeSession {
@@ -13,12 +13,12 @@ struct OpenCodeSession {
     directory: PathBuf,
     updated_at: i64,
     user_messages: Vec<String>,
-    assistant_messages: Vec<String>,
+    last_assistant_message: Option<String>,
 }
 
-pub(crate) fn load(path: &Path) -> Result<Vec<Session>> {
+pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(ProviderDiscovery::default());
     }
     let connection = Connection::open_with_flags(
         path,
@@ -38,34 +38,66 @@ pub(crate) fn load(path: &Path) -> Result<Vec<Session>> {
     let mut rows = statement
         .query([])
         .context("could not query OpenCode sessions")?;
-    let mut sessions = Vec::new();
+    let mut discovery = ProviderDiscovery::default();
     let mut current: Option<OpenCodeSession> = None;
+    let mut malformed_records = 0_usize;
     while let Some(row) = rows.next().context("could not read an OpenCode session")? {
-        let id: String = row.get(0)?;
+        let id: String = match row.get(0) {
+            Ok(id) => id,
+            Err(_) => {
+                malformed_records += 1;
+                continue;
+            }
+        };
         if current.as_ref().is_some_and(|session| session.id != id) {
-            push_finished(&mut sessions, current.take());
+            push_finished(&mut discovery.sessions, current.take());
         }
-        let session = current.get_or_insert_with(|| OpenCodeSession {
-            id,
-            title: row.get(1).unwrap_or_default(),
-            directory: row
-                .get::<_, String>(2)
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            updated_at: row.get(3).unwrap_or_default(),
-            user_messages: Vec::new(),
-            assistant_messages: Vec::new(),
-        });
-        let message_data: Option<String> = row.get(4)?;
-        let part_data: Option<String> = row.get(5)?;
+        if current.is_none() {
+            let metadata = (
+                row.get::<_, Option<String>>(1),
+                row.get::<_, Option<String>>(2),
+                row.get::<_, Option<i64>>(3),
+            );
+            let (Ok(title), Ok(directory), Ok(updated_at)) = metadata else {
+                malformed_records += 1;
+                continue;
+            };
+            current = Some(OpenCodeSession {
+                id,
+                title: title.unwrap_or_default(),
+                directory: directory.map(PathBuf::from).unwrap_or_default(),
+                updated_at: updated_at.unwrap_or_default(),
+                user_messages: Vec::new(),
+                last_assistant_message: None,
+            });
+        }
+        let Some(session) = current.as_mut() else {
+            continue;
+        };
+        let (message_data, part_data): (Option<String>, Option<String>) =
+            match (row.get(4), row.get(5)) {
+                (Ok(message_data), Ok(part_data)) => (message_data, part_data),
+                (Err(_), _) | (_, Err(_)) => {
+                    malformed_records += 1;
+                    continue;
+                }
+            };
         let (Some(message_data), Some(part_data)) = (message_data, part_data) else {
             continue;
         };
-        let Ok(message) = serde_json::from_str::<Value>(&message_data) else {
-            continue;
+        let message = match serde_json::from_str::<Value>(&message_data) {
+            Ok(message) => message,
+            Err(_) => {
+                malformed_records += 1;
+                continue;
+            }
         };
-        let Ok(part) = serde_json::from_str::<Value>(&part_data) else {
-            continue;
+        let part = match serde_json::from_str::<Value>(&part_data) {
+            Ok(part) => part,
+            Err(_) => {
+                malformed_records += 1;
+                continue;
+            }
         };
         if part.get("type").and_then(Value::as_str) != Some("text") {
             continue;
@@ -82,12 +114,18 @@ pub(crate) fn load(path: &Path) -> Result<Vec<Session>> {
         };
         match message.get("role").and_then(Value::as_str) {
             Some("user") => session.user_messages.push(text),
-            Some("assistant") => session.assistant_messages.push(text),
+            Some("assistant") => session.last_assistant_message = Some(text),
             _ => {}
         }
     }
-    push_finished(&mut sessions, current);
-    Ok(sessions)
+    push_finished(&mut discovery.sessions, current);
+    if malformed_records != 0 {
+        discovery.warnings.push(format!(
+            "ignored {malformed_records} malformed database record(s) in {}",
+            path.display()
+        ));
+    }
+    Ok(discovery)
 }
 
 fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) {
@@ -103,7 +141,7 @@ fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) 
             updated_at: session.updated_at,
         },
         session.user_messages,
-        session.assistant_messages,
+        session.last_assistant_message,
     ) {
         sessions.push(session);
     }
@@ -188,12 +226,48 @@ mod tests {
             .expect("child session");
         drop(connection);
 
-        let sessions = load(&path).expect("load sessions");
+        let sessions = load(&path).expect("load sessions").sessions;
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].user_messages, ["Fix API auth"]);
         assert_eq!(sessions[0].title.as_deref(), Some("API cleanup"));
         assert!(!sessions[0].search_text().contains("hidden tool"));
         assert!(!sessions[0].search_text().contains("generated prompt"));
+    }
+
+    #[test]
+    fn malformed_json_warns_without_hiding_valid_parts() {
+        let root = tempdir().expect("temp directory");
+        let path = root.path().join("opencode.db");
+        let connection = Connection::open(&path).expect("database");
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_updated INTEGER,
+                    parent_id TEXT
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+                );
+                CREATE TABLE part (
+                    id TEXT PRIMARY KEY, message_id TEXT, time_created INTEGER, data TEXT
+                );
+                INSERT INTO session VALUES ('ses_1', 'Title', '/work', 1000, NULL);
+                INSERT INTO message VALUES ('msg_1', 'ses_1', 100, '{\"role\":\"user\"}');
+                INSERT INTO part VALUES ('part_1', 'msg_1', 101, 'not json');
+                INSERT INTO part VALUES (
+                    'part_2', 'msg_1', 102, '{\"type\":\"text\",\"text\":\"Valid request\"}'
+                );",
+            )
+            .expect("fixture database");
+        drop(connection);
+
+        let discovery = load(&path).expect("load sessions");
+
+        assert_eq!(discovery.sessions.len(), 1);
+        assert_eq!(discovery.sessions[0].user_messages, ["Valid request"]);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(discovery.warnings[0].contains("1 malformed database record"));
+        assert!(!discovery.warnings[0].contains("not json"));
     }
 }

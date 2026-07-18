@@ -3,7 +3,7 @@ use std::path::{Component, Path};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Days, Local, TimeZone};
+use chrono::{DateTime, Days, Local, NaiveDate, TimeZone};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseEvent, MouseEventKind,
@@ -26,6 +26,7 @@ const HORIZONTAL_LAYOUT_MIN_WIDTH: u16 = 110;
 const LIST_ITEM_HEIGHT: usize = 2;
 const RANGE_FILTER_WIDTH: u16 = 12;
 const PROVIDER_FILTER_WIDTH: u16 = 12;
+const SEARCH_MIN_WIDTH: u16 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DayRange {
@@ -123,6 +124,7 @@ struct App<'a> {
     query: String,
     visible: Vec<usize>,
     list_state: ListState,
+    search_inner: Rect,
     list_inner: Rect,
     detail_inner: Rect,
     range_inner: Rect,
@@ -156,6 +158,7 @@ impl<'a> App<'a> {
             query: String::new(),
             visible,
             list_state: ListState::default().with_selected(selected),
+            search_inner: Rect::default(),
             list_inner: Rect::default(),
             detail_inner: Rect::default(),
             range_inner: Rect::default(),
@@ -177,19 +180,22 @@ impl<'a> App<'a> {
                 Constraint::Length(1),
             ])
             .split(frame.area());
+        let filter_width = filter_width(sections[0].width);
         let top = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(RANGE_FILTER_WIDTH),
-                Constraint::Length(PROVIDER_FILTER_WIDTH),
+                Constraint::Length(filter_width.min(RANGE_FILTER_WIDTH)),
+                Constraint::Length(filter_width.min(PROVIDER_FILTER_WIDTH)),
             ])
             .split(sections[0]);
-        let search = Paragraph::new(format!("> {}", self.query)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Search messages, titles, and directories "),
-        );
+        let search_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Search messages, titles, and directories ");
+        self.search_inner = search_block.inner(top[0]);
+        let search = Paragraph::new(format!("> {}", self.query))
+            .block(search_block)
+            .scroll((0, search_scroll(self.search_inner, &self.query)));
         frame.render_widget(search, top[0]);
         let range_block = Block::default().borders(Borders::ALL).title(" Range ");
         self.range_inner = range_block.inner(top[1]);
@@ -315,10 +321,9 @@ impl<'a> App<'a> {
             )),
             sections[2],
         );
-        frame.set_cursor_position((
-            top[0].x + 3 + self.query.chars().count() as u16,
-            top[0].y + 1,
-        ));
+        if self.search_inner.width != 0 && self.search_inner.height != 0 {
+            frame.set_cursor_position(search_cursor(self.search_inner, &self.query));
+        }
     }
 
     fn key(&mut self, key: KeyEvent) -> Option<Option<Selection>> {
@@ -429,17 +434,26 @@ impl<'a> App<'a> {
             {
                 self.detail_scroll = self.detail_scroll.saturating_add(3);
             }
-            MouseEventKind::ScrollUp => self.move_selection(-1),
-            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp
+                if self.list_inner.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.move_selection(-1);
+            }
+            MouseEventKind::ScrollDown
+                if self.list_inner.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.move_selection(1);
+            }
             MouseEventKind::Down(_)
                 if self.list_inner.contains((mouse.column, mouse.row).into()) =>
             {
-                let row = usize::from(mouse.row.saturating_sub(self.list_inner.y));
-                let index = self
-                    .list_state
-                    .offset()
-                    .saturating_add(row / LIST_ITEM_HEIGHT);
-                if index < self.visible.len() {
+                if let Some(index) = list_index_at(
+                    self.list_inner,
+                    self.list_state.offset(),
+                    self.visible.len(),
+                    mouse.column,
+                    mouse.row,
+                ) {
                     self.select(index);
                 }
             }
@@ -447,6 +461,8 @@ impl<'a> App<'a> {
             | MouseEventKind::Up(_)
             | MouseEventKind::Drag(_)
             | MouseEventKind::Moved
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {}
         }
@@ -536,17 +552,19 @@ fn day_range_label(range: DayRange) -> &'static str {
 }
 
 fn day_range_cutoff(range: DayRange, now: DateTime<Local>) -> Option<i64> {
-    let DayRange::Days(days) = range else {
-        return None;
-    };
-    let date = now
-        .date_naive()
-        .checked_sub_days(Days::new(u64::from(days.saturating_sub(1))))?;
+    let date = day_range_start_date(range, now.date_naive())?;
     let midnight = date.and_hms_opt(0, 0, 0)?;
     Local
         .from_local_datetime(&midnight)
         .earliest()
         .map(|date| date.timestamp_millis())
+}
+
+fn day_range_start_date(range: DayRange, today: NaiveDate) -> Option<NaiveDate> {
+    let DayRange::Days(days) = range else {
+        return None;
+    };
+    today.checked_sub_days(Days::new(u64::from(days.saturating_sub(1))))
 }
 
 fn next_provider_filter(current: Option<Provider>) -> Option<Provider> {
@@ -574,6 +592,25 @@ fn padded_label(label: &str, width: u16) -> String {
     let left = remaining / 2;
     let right = remaining - left;
     format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
+}
+
+fn filter_width(total_width: u16) -> u16 {
+    (total_width.saturating_sub(SEARCH_MIN_WIDTH) / 2)
+        .min(RANGE_FILTER_WIDTH.max(PROVIDER_FILTER_WIDTH))
+}
+
+fn search_cursor(inner: Rect, query: &str) -> (u16, u16) {
+    let query_width = Line::from(query).width();
+    let relative_x = 2_usize
+        .saturating_add(query_width)
+        .min(usize::from(inner.width.saturating_sub(1)));
+    (inner.x.saturating_add(relative_x as u16), inner.y)
+}
+
+fn search_scroll(inner: Rect, query: &str) -> u16 {
+    let content_width = 2_usize.saturating_add(Line::from(query).width());
+    let visible_before_cursor = usize::from(inner.width.saturating_sub(1));
+    u16::try_from(content_width.saturating_sub(visible_before_cursor)).unwrap_or(u16::MAX)
 }
 
 fn pane_direction(width: u16) -> Direction {
@@ -627,6 +664,21 @@ fn list_viewport(
     (offset, offset.saturating_add(height).min(item_count))
 }
 
+fn list_index_at(
+    inner: Rect,
+    offset: usize,
+    item_count: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if !inner.contains((column, row).into()) {
+        return None;
+    }
+    let relative_row = usize::from(row.saturating_sub(inner.y));
+    let index = offset.saturating_add(relative_row / LIST_ITEM_HEIGHT);
+    (index < item_count).then_some(index)
+}
+
 fn fuzzy_match(haystack: &str, query: &str) -> bool {
     query.split_whitespace().all(|word| {
         let mut characters = word.chars();
@@ -658,7 +710,7 @@ fn search_rank(search_text: &str, path: &str, query: &str) -> Option<u8> {
 
 fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
     let (title_max_chars, text_max_chars, received_max_chars) = detail_cutoffs(stacked);
-    let mut lines = vec![
+    vec![
         field("Provider", session.provider.label()),
         field("Updated", &full_time(session.updated_at)),
         field("Session", &session.id),
@@ -694,9 +746,7 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
                 .unwrap_or("not available"),
             received_max_chars,
         )),
-    ];
-    lines.shrink_to_fit();
-    lines
+    ]
 }
 
 fn detail_cutoffs(stacked: bool) -> (usize, usize, usize) {
@@ -801,8 +851,8 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let characters = value.chars().collect::<Vec<_>>();
-    if characters.len() <= max_chars {
+    let character_count = value.chars().count();
+    if character_count <= max_chars {
         return value.to_owned();
     }
     if max_chars <= 3 {
@@ -812,9 +862,10 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     let prefix_len = retained / 2;
     let suffix_len = retained - prefix_len;
     let mut result = String::with_capacity(max_chars);
-    result.extend(&characters[..prefix_len]);
+    result.extend(value.chars().take(prefix_len));
     result.push_str("...");
-    result.extend(&characters[characters.len() - suffix_len..]);
+    let suffix = value.chars().rev().take(suffix_len).collect::<Vec<_>>();
+    result.extend(suffix.into_iter().rev());
     result
 }
 
@@ -822,16 +873,17 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
 mod tests {
     use std::path::Path;
 
-    use chrono::{Local, TimeZone};
+    use chrono::NaiveDate;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
     use sfind::{Provider, Session};
 
     use super::{
-        compact_path, day_range_cutoff, day_range_label, delete_last_word, detail_cutoffs,
-        directory_color, fuzzy_match, list_item_capacity, list_title_capacity, list_viewport,
-        next_day_range, next_provider_filter, padded_label, pane_direction, provider_short_label,
-        search_rank, truncate, truncate_middle, App, DayRange, Selection,
+        compact_path, day_range_label, day_range_start_date, delete_last_word, detail_cutoffs,
+        directory_color, filter_width, fuzzy_match, list_index_at, list_item_capacity,
+        list_title_capacity, list_viewport, next_day_range, next_provider_filter, padded_label,
+        pane_direction, provider_short_label, search_cursor, search_rank, search_scroll, truncate,
+        truncate_middle, App, DayRange, Selection,
     };
 
     #[test]
@@ -886,19 +938,31 @@ mod tests {
     }
 
     #[test]
-    fn day_ranges_start_at_local_calendar_midnight() {
-        let now = Local
-            .with_ymd_and_hms(2026, 7, 18, 15, 30, 0)
-            .single()
-            .expect("unambiguous local test time");
-        let expected = Local
-            .with_ymd_and_hms(2026, 7, 16, 0, 0, 0)
-            .earliest()
-            .expect("local midnight")
-            .timestamp_millis();
+    fn narrow_headers_reserve_space_for_search() {
+        assert_eq!(filter_width(20), 6);
+        assert_eq!(filter_width(40), 12);
+    }
 
-        assert_eq!(day_range_cutoff(DayRange::All, now), None);
-        assert_eq!(day_range_cutoff(DayRange::Days(3), now), Some(expected));
+    #[test]
+    fn search_cursor_accounts_for_origin_width_and_unicode() {
+        let inner = ratatui::layout::Rect::new(4, 2, 8, 1);
+
+        assert_eq!(search_cursor(inner, "é"), (7, 2));
+        assert_eq!(search_cursor(inner, "query longer than pane"), (11, 2));
+        assert_eq!(search_scroll(inner, "é"), 0);
+        assert_eq!(search_scroll(inner, "12345678"), 3);
+    }
+
+    #[test]
+    fn day_ranges_use_local_calendar_dates() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid test date");
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 16).expect("valid test date");
+
+        assert_eq!(day_range_start_date(DayRange::All, today), None);
+        assert_eq!(
+            day_range_start_date(DayRange::Days(3), today),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -973,6 +1037,15 @@ mod tests {
             list_viewport(Some(9_999), 9_980, 20, 10_000),
             (9_980, 10_000)
         );
+    }
+
+    #[test]
+    fn list_mouse_index_accounts_for_pane_origin_and_viewport_offset() {
+        let inner = ratatui::layout::Rect::new(10, 5, 30, 8);
+
+        assert_eq!(list_index_at(inner, 20, 100, 11, 7), Some(21));
+        assert_eq!(list_index_at(inner, 20, 100, 9, 7), None);
+        assert_eq!(list_index_at(inner, 99, 100, 11, 7), None);
     }
 
     #[test]

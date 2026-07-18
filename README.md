@@ -20,14 +20,16 @@ providers, Codex, OpenCode (`open`), and Claude.
 
 Press `Ctrl-P` to close the finder and print a safely quoted command that changes to the project
 directory and resumes the selected session. The command is printed but not executed. Press
-`Ctrl-Delete` or `Ctrl-Backspace` to remove the last word from the search query.
+`Ctrl-Delete`, `Ctrl-Backspace`, or `Ctrl-W` to remove the last word from the search query. Use
+`Ctrl-Up` and `Ctrl-Down` or the mouse wheel over the details pane to scroll long details.
 
 Press `Tab` to toggle Fork mode. The selected row turns red and the details header shows `FORK`.
 Enter then starts a new provider session forked from the selected history; `Ctrl-P` prints the
 equivalent fork command instead. Continue mode remains the default.
 
 Assistant messages, tool inputs and outputs, synthetic prompts, subagent sessions, and injected
-environment metadata are excluded from search.
+environment metadata are excluded from search. Unreadable or malformed provider records are
+skipped with warnings so other sessions can still be used.
 
 Use plain newest-first output without the TUI:
 

@@ -6,15 +6,26 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::{finish_session, text_blocks, timestamp_millis, Provider, Session, SessionHeader};
+use crate::{
+    finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
+    SessionHeader,
+};
 
-pub(crate) fn load(root: &Path) -> Result<Vec<Session>> {
+pub(crate) fn load(root: &Path) -> Result<ProviderDiscovery> {
     if !root.exists() {
-        return Ok(Vec::new());
+        return Ok(ProviderDiscovery::default());
     }
-    let mut sessions = Vec::new();
+    let mut discovery = ProviderDiscovery::default();
     for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry.with_context(|| format!("could not walk {}", root.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                discovery
+                    .warnings
+                    .push(format!("could not walk {}: {error}", root.display()));
+                continue;
+            }
+        };
         if entry.file_type().is_file()
             && entry.path().extension().is_some_and(|ext| ext == "jsonl")
             && !entry
@@ -22,15 +33,17 @@ pub(crate) fn load(root: &Path) -> Result<Vec<Session>> {
                 .components()
                 .any(|part| part.as_os_str() == "subagents")
         {
-            if let Some(session) = parse(entry.path())? {
-                sessions.push(session);
+            match parse(entry.path(), &mut discovery.warnings) {
+                Ok(Some(session)) => discovery.sessions.push(session),
+                Ok(None) => {}
+                Err(error) => discovery.warnings.push(format!("{error:#}")),
             }
         }
     }
-    Ok(sessions)
+    Ok(discovery)
 }
 
-fn parse(path: &Path) -> Result<Option<Session>> {
+fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     let id = path
         .file_stem()
@@ -40,12 +53,20 @@ fn parse(path: &Path) -> Result<Option<Session>> {
     let mut directory = None;
     let mut updated_at = 0;
     let mut user_messages = Vec::new();
-    let mut assistant_messages = Vec::new();
+    let mut last_assistant_message = None;
 
-    for line in BufReader::new(file).lines() {
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.with_context(|| format!("could not read {}", path.display()))?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "could not parse {} line {}: {error}",
+                    path.display(),
+                    line_index + 1
+                ));
+                continue;
+            }
         };
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
@@ -75,7 +96,7 @@ fn parse(path: &Path) -> Result<Option<Session>> {
             .and_then(|content| text_blocks(content, &["text"]));
         match (message.get("role").and_then(Value::as_str), text) {
             (Some("user"), Some(text)) => user_messages.push(text),
-            (Some("assistant"), Some(text)) => assistant_messages.push(text),
+            (Some("assistant"), Some(text)) => last_assistant_message = Some(text),
             _ => {}
         }
     }
@@ -89,7 +110,7 @@ fn parse(path: &Path) -> Result<Option<Session>> {
                 updated_at,
             },
             user_messages,
-            assistant_messages,
+            last_assistant_message,
         )
     }))
 }
@@ -117,16 +138,20 @@ mod tests {
                 r#"{"type":"user","sessionId":"claude-1","timestamp":"2026-01-02T10:02:00Z","message":{"role":"user","content":[{"type":"tool_result","content":"private tool result"}]}}"#,
                 "\n",
                 r#"{"type":"assistant","sessionId":"claude-1","timestamp":"2026-01-02T10:03:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Here is the plan."}]}}"#,
+                "\nnot json",
                 "\n"
             ),
         )
         .expect("fixture write");
 
-        let sessions = load(root.path()).expect("load sessions");
+        let discovery = load(root.path()).expect("load sessions");
+        let sessions = discovery.sessions;
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title.as_deref(), Some("Database migration"));
         assert_eq!(sessions[0].user_messages, ["Plan the migration"]);
         assert!(!sessions[0].search_text().contains("private tool result"));
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(discovery.warnings[0].contains("line 5"));
     }
 }

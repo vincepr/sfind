@@ -4,6 +4,7 @@ mod claude;
 mod codex;
 mod opencode;
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
@@ -60,8 +61,13 @@ impl Session {
     #[must_use]
     pub fn search_text(&self) -> String {
         let capacity = self.title.as_ref().map_or(0, String::len)
+            + self
+                .directory
+                .as_ref()
+                .map_or(0, |path| path.as_os_str().len())
             + self.user_messages.iter().map(String::len).sum::<usize>()
-            + self.user_messages.len();
+            + self.user_messages.len()
+            + 2;
         let mut text = String::with_capacity(capacity);
         if let Some(title) = &self.title {
             text.push_str(title);
@@ -118,8 +124,14 @@ fn env_path(name: &str) -> Option<PathBuf> {
 pub struct Discovery {
     /// Sessions sorted by latest activity first.
     pub sessions: Vec<Session>,
-    /// Provider errors that did not prevent other providers from loading.
+    /// Provider errors and recoverable malformed-data warnings.
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderDiscovery {
+    sessions: Vec<Session>,
+    warnings: Vec<String>,
 }
 
 /// Loads all available provider sessions from the supplied roots.
@@ -147,9 +159,17 @@ pub fn discover_sessions(roots: &SessionRoots) -> Discovery {
     discovery
 }
 
-fn collect(discovery: &mut Discovery, provider: &str, result: Result<Vec<Session>>) {
+fn collect(discovery: &mut Discovery, provider: &str, result: Result<ProviderDiscovery>) {
     match result {
-        Ok(mut sessions) => discovery.sessions.append(&mut sessions),
+        Ok(mut provider_discovery) => {
+            discovery.sessions.append(&mut provider_discovery.sessions);
+            discovery.warnings.extend(
+                provider_discovery
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("{provider}: {warning}")),
+            );
+        }
         Err(error) => discovery.warnings.push(format!("{provider}: {error:#}")),
     }
 }
@@ -210,19 +230,39 @@ fn printable_session_command(session: &Session, fork: bool) -> String {
             )
         }
     };
-    session
-        .directory
-        .as_ref()
-        .map_or(resume.clone(), |directory| {
-            format!(
-                "cd {} && {resume}",
-                shell_quote(&directory.to_string_lossy())
-            )
-        })
+    match &session.directory {
+        Some(directory) => format!("cd {} && {resume}", shell_quote_os(directory.as_os_str())),
+        None => resume,
+    }
 }
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn shell_quote_os(value: &OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    if let Some(value) = value.to_str() {
+        return shell_quote(value);
+    }
+    let mut quoted = String::from("$'");
+    for &byte in value.as_bytes() {
+        match byte {
+            b'\\' => quoted.push_str("\\\\"),
+            b'\'' => quoted.push_str("\\'"),
+            0x20..=0x7e => quoted.push(char::from(byte)),
+            _ => quoted.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+#[cfg(not(unix))]
+fn shell_quote_os(value: &OsStr) -> String {
+    shell_quote(&value.to_string_lossy())
 }
 
 fn session_process(session: &Session, fork: bool) -> Command {
@@ -263,8 +303,15 @@ fn session_process(session: &Session, fork: bool) -> Command {
 }
 
 fn normalized_text(value: &str) -> Option<String> {
-    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!text.is_empty()).then_some(text)
+    let mut words = value.split_whitespace();
+    let first = words.next()?;
+    let mut text = String::with_capacity(value.len());
+    text.push_str(first);
+    for word in words {
+        text.push(' ');
+        text.push_str(word);
+    }
+    Some(text)
 }
 
 fn timestamp_millis(value: &serde_json::Value) -> Option<i64> {
@@ -283,19 +330,24 @@ fn text_blocks(content: &serde_json::Value, accepted_types: &[&str]) -> Option<S
     if let Some(text) = content.as_str() {
         return normalized_text(text);
     }
-    let text = content
-        .as_array()?
-        .iter()
-        .filter(|block| {
-            block
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| accepted_types.contains(&kind))
-        })
-        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    normalized_text(&text)
+    let mut text = String::new();
+    for block in content.as_array()?.iter().filter(|block| {
+        block
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| accepted_types.contains(&kind))
+    }) {
+        let Some(block_text) = block.get("text").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        for word in block_text.split_whitespace() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(word);
+        }
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 struct SessionHeader {
@@ -309,7 +361,7 @@ struct SessionHeader {
 fn finish_session(
     header: SessionHeader,
     user_messages: Vec<String>,
-    assistant_messages: Vec<String>,
+    last_assistant_message: Option<String>,
 ) -> Option<Session> {
     Some(Session {
         provider: header.provider,
@@ -319,7 +371,7 @@ fn finish_session(
         updated_at: header.updated_at,
         first_user_message: user_messages.first()?.clone(),
         last_user_message: user_messages.last()?.clone(),
-        last_assistant_message: assistant_messages.last().cloned(),
+        last_assistant_message,
         user_messages,
     })
 }
@@ -327,6 +379,9 @@ fn finish_session(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use std::ffi::OsString;
 
     use super::{fork_session_command, session_command, session_process, Provider, Session};
 
@@ -402,6 +457,31 @@ mod tests {
         assert_eq!(
             command,
             "cd '/work/project'\"'\"'s app' && codex resume 'session'\"'\"'1'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn printable_command_preserves_non_utf8_directory_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let session = Session {
+            provider: Provider::Claude,
+            id: "session-1".to_owned(),
+            title: None,
+            directory: Some(PathBuf::from(OsString::from_vec(
+                b"/work/invalid-\xff".to_vec(),
+            ))),
+            updated_at: 0,
+            first_user_message: "first".to_owned(),
+            last_user_message: "last".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["first".to_owned()],
+        };
+
+        assert_eq!(
+            session_command(&session),
+            "cd $'/work/invalid-\\xff' && claude --resume 'session-1'"
         );
     }
 

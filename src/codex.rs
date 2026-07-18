@@ -8,61 +8,124 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::{finish_session, text_blocks, timestamp_millis, Provider, Session, SessionHeader};
+use crate::{
+    finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
+    SessionHeader,
+};
 
-pub(crate) fn load(home: &Path) -> Result<Vec<Session>> {
+pub(crate) fn load(home: &Path) -> Result<ProviderDiscovery> {
     let root = home.join("sessions");
     if !root.exists() {
-        return Ok(Vec::new());
+        return Ok(ProviderDiscovery::default());
     }
-    let titles = load_titles(&home.join("state_5.sqlite"));
-    let mut sessions = Vec::new();
+    let mut discovery = ProviderDiscovery::default();
+    let titles = load_titles(&home.join("state_5.sqlite"), &mut discovery.warnings);
     for entry in WalkDir::new(&root).follow_links(false) {
-        let entry = entry.with_context(|| format!("could not walk {}", root.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                discovery
+                    .warnings
+                    .push(format!("could not walk {}: {error}", root.display()));
+                continue;
+            }
+        };
         if entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "jsonl")
         {
-            if let Some(mut session) = parse(entry.path())? {
-                if session.title.is_none() {
-                    session.title = titles.get(&session.id).cloned();
+            match parse(entry.path(), &mut discovery.warnings) {
+                Ok(Some(mut session)) => {
+                    if session.title.is_none() {
+                        session.title = titles.get(&session.id).cloned();
+                    }
+                    discovery.sessions.push(session);
                 }
-                sessions.push(session);
+                Ok(None) => {}
+                Err(error) => discovery.warnings.push(format!("{error:#}")),
             }
         }
     }
-    Ok(sessions)
+    Ok(discovery)
 }
 
-fn load_titles(path: &Path) -> HashMap<String, String> {
-    let Ok(connection) = Connection::open_with_flags(
+fn load_titles(path: &Path, warnings: &mut Vec<String>) -> HashMap<String, String> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let connection = match Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return HashMap::new();
+    ) {
+        Ok(connection) => connection,
+        Err(error) => {
+            warnings.push(format!(
+                "could not open {} read-only: {error}",
+                path.display()
+            ));
+            return HashMap::new();
+        }
     };
-    let Ok(mut statement) = connection.prepare("SELECT id, title FROM threads") else {
-        return HashMap::new();
+    let mut statement = match connection.prepare("SELECT id, title FROM threads") {
+        Ok(statement) => statement,
+        Err(error) => {
+            warnings.push(format!(
+                "could not read titles from {}: {error}",
+                path.display()
+            ));
+            return HashMap::new();
+        }
     };
-    let Ok(rows) = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) else {
-        return HashMap::new();
+    let rows = match statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+        Ok(rows) => rows,
+        Err(error) => {
+            warnings.push(format!(
+                "could not query titles from {}: {error}",
+                path.display()
+            ));
+            return HashMap::new();
+        }
     };
-    rows.filter_map(Result::ok).collect()
+    let mut titles = HashMap::new();
+    let mut malformed_rows = 0;
+    for row in rows {
+        match row {
+            Ok((id, title)) => {
+                titles.insert(id, title);
+            }
+            Err(_) => malformed_rows += 1,
+        }
+    }
+    if malformed_rows != 0 {
+        warnings.push(format!(
+            "ignored {malformed_rows} malformed title row(s) in {}",
+            path.display()
+        ));
+    }
+    titles
 }
 
-fn parse(path: &Path) -> Result<Option<Session>> {
+fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     let mut id = None;
     let mut title = None;
     let mut directory = None;
     let mut updated_at = 0;
     let mut user_messages = Vec::new();
-    let mut assistant_messages = Vec::new();
+    let mut last_assistant_message = None;
     let mut fallback_users = Vec::new();
-    let mut fallback_assistants = Vec::new();
+    let mut fallback_assistant_message = None;
 
-    for line in BufReader::new(file).lines() {
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.with_context(|| format!("could not read {}", path.display()))?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "could not parse {} line {}: {error}",
+                    path.display(),
+                    line_index + 1
+                ));
+                continue;
+            }
         };
         updated_at = value
             .get("timestamp")
@@ -94,8 +157,10 @@ fn parse(path: &Path) -> Result<Option<Session>> {
                     text_blocks(content, &["input_text", "output_text", "text"])
                 });
                 match (payload.get("role").and_then(Value::as_str), text) {
-                    (Some("user"), Some(text)) => user_messages.push(text),
-                    (Some("assistant"), Some(text)) => assistant_messages.push(text),
+                    (Some("user"), Some(text)) if !is_injected_user_message(&text) => {
+                        user_messages.push(text);
+                    }
+                    (Some("assistant"), Some(text)) => last_assistant_message = Some(text),
                     _ => {}
                 }
             }
@@ -106,7 +171,7 @@ fn parse(path: &Path) -> Result<Option<Session>> {
                     .and_then(crate::normalized_text);
                 match (payload.get("type").and_then(Value::as_str), message) {
                     (Some("user_message"), Some(text)) => fallback_users.push(text),
-                    (Some("agent_message"), Some(text)) => fallback_assistants.push(text),
+                    (Some("agent_message"), Some(text)) => fallback_assistant_message = Some(text),
                     _ => {}
                 }
             }
@@ -116,8 +181,8 @@ fn parse(path: &Path) -> Result<Option<Session>> {
     if !fallback_users.is_empty() {
         user_messages = fallback_users;
     }
-    if assistant_messages.is_empty() {
-        assistant_messages = fallback_assistants;
+    if last_assistant_message.is_none() {
+        last_assistant_message = fallback_assistant_message;
     }
     let id = id.or_else(|| id_from_filename(path));
     Ok(id.and_then(|id| {
@@ -130,23 +195,34 @@ fn parse(path: &Path) -> Result<Option<Session>> {
                 updated_at,
             },
             user_messages,
-            assistant_messages,
+            last_assistant_message,
         )
     }))
 }
 
+fn is_injected_user_message(message: &str) -> bool {
+    [
+        "<environment_context>",
+        "<user_instructions>",
+        "<system-reminder>",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
 fn id_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    (stem.len() >= 36).then(|| stem[stem.len() - 36..].to_owned())
+    stem.get(stem.len().checked_sub(36)?..).map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
-    use super::load;
+    use super::{id_from_filename, load};
 
     #[test]
     fn parses_codex_messages_and_ignores_tool_content() {
@@ -175,7 +251,8 @@ mod tests {
         )
         .expect("fixture write");
 
-        let sessions = load(root.path()).expect("load sessions");
+        let discovery = load(root.path()).expect("load sessions");
+        let sessions = discovery.sessions;
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "codex-1");
@@ -183,5 +260,63 @@ mod tests {
         assert_eq!(sessions[0].user_messages, ["Fix the login flow"]);
         assert!(!sessions[0].search_text().contains("secret tool text"));
         assert!(!sessions[0].search_text().contains("private metadata"));
+    }
+
+    #[test]
+    fn malformed_lines_warn_without_hiding_valid_session_data() {
+        let root = tempdir().expect("temp directory");
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).expect("sessions directory");
+        fs::write(
+            sessions.join("session.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"codex-1"}}"#,
+                "\nnot json\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"Valid request"}}"#,
+                "\n"
+            ),
+        )
+        .expect("fixture write");
+
+        let discovery = load(root.path()).expect("load sessions");
+
+        assert_eq!(discovery.sessions.len(), 1);
+        assert_eq!(discovery.sessions[0].user_messages, ["Valid request"]);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(discovery.warnings[0].contains("line 2"));
+        assert!(!discovery.warnings[0].contains("not json"));
+    }
+
+    #[test]
+    fn non_ascii_filename_without_metadata_does_not_panic() {
+        let filename = format!("{}a.jsonl", "é".repeat(18));
+
+        assert_eq!(id_from_filename(Path::new(&filename)), None);
+    }
+
+    #[test]
+    fn response_items_exclude_injected_environment_without_event_fallback() {
+        let root = tempdir().expect("temp directory");
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).expect("sessions directory");
+        fs::write(
+            sessions.join("session.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"codex-1"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"<environment_context>private metadata</environment_context>"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"Real request"}}"#,
+                "\n"
+            ),
+        )
+        .expect("fixture write");
+
+        let discovery = load(root.path()).expect("load sessions");
+
+        assert_eq!(discovery.sessions[0].user_messages, ["Real request"]);
+        assert!(!discovery.sessions[0]
+            .search_text()
+            .contains("private metadata"));
     }
 }
