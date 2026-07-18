@@ -1,0 +1,309 @@
+//! Discovery and normalization of local coding CLI sessions.
+
+mod claude;
+mod codex;
+mod opencode;
+
+use std::path::PathBuf;
+use std::process::{Command, ExitStatus};
+
+use anyhow::{Context, Result};
+
+/// A coding CLI that owns a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Provider {
+    /// OpenAI Codex CLI.
+    Codex,
+    /// OpenCode CLI.
+    OpenCode,
+    /// Anthropic Claude Code CLI.
+    Claude,
+}
+
+impl Provider {
+    /// Returns the short provider label displayed by the finder.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+/// Provider-independent session data used by the finder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Session {
+    /// CLI that owns the session.
+    pub provider: Provider,
+    /// Provider session identifier used to resume it.
+    pub id: String,
+    /// Provider-generated title or summary, when available.
+    pub title: Option<String>,
+    /// Working directory associated with the session.
+    pub directory: Option<PathBuf>,
+    /// Last activity time as Unix milliseconds.
+    pub updated_at: i64,
+    /// First user-authored message.
+    pub first_user_message: String,
+    /// Most recent user-authored message.
+    pub last_user_message: String,
+    /// Most recent assistant text response.
+    pub last_assistant_message: Option<String>,
+    /// All user-authored messages; this is the only message content searched.
+    pub user_messages: Vec<String>,
+}
+
+impl Session {
+    /// Returns searchable text containing only title/summary and user-authored messages.
+    #[must_use]
+    pub fn search_text(&self) -> String {
+        let capacity = self.title.as_ref().map_or(0, String::len)
+            + self.user_messages.iter().map(String::len).sum::<usize>()
+            + self.user_messages.len();
+        let mut text = String::with_capacity(capacity);
+        if let Some(title) = &self.title {
+            text.push_str(title);
+            text.push('\n');
+        }
+        for message in &self.user_messages {
+            text.push_str(message);
+            text.push('\n');
+        }
+        text
+    }
+}
+
+/// Default provider storage locations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRoots {
+    /// Codex home containing `sessions/`.
+    pub codex_home: PathBuf,
+    /// OpenCode data directory containing `opencode.db`.
+    pub opencode_data: PathBuf,
+    /// Claude home containing `projects/`.
+    pub claude_home: PathBuf,
+}
+
+impl SessionRoots {
+    /// Resolves provider roots from environment overrides and standard home directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user's home or data directory cannot be resolved.
+    pub fn discover() -> Result<Self> {
+        let home = dirs::home_dir().context("could not resolve the home directory")?;
+        let data = dirs::data_dir().context("could not resolve the user data directory")?;
+        Ok(Self {
+            codex_home: env_path("CODEX_HOME").unwrap_or_else(|| home.join(".codex")),
+            opencode_data: env_path("OPENCODE_DATA_DIR").unwrap_or_else(|| data.join("opencode")),
+            claude_home: env_path("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")),
+        })
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Sessions found across all supported providers, plus non-fatal adapter warnings.
+#[derive(Debug, Default)]
+pub struct Discovery {
+    /// Sessions sorted by latest activity first.
+    pub sessions: Vec<Session>,
+    /// Provider errors that did not prevent other providers from loading.
+    pub warnings: Vec<String>,
+}
+
+/// Loads all available provider sessions from the supplied roots.
+#[must_use]
+pub fn discover_sessions(roots: &SessionRoots) -> Discovery {
+    let mut discovery = Discovery::default();
+    collect(&mut discovery, "Codex", codex::load(&roots.codex_home));
+    collect(
+        &mut discovery,
+        "OpenCode",
+        opencode::load(&roots.opencode_data.join("opencode.db")),
+    );
+    collect(
+        &mut discovery,
+        "Claude Code",
+        claude::load(&roots.claude_home.join("projects")),
+    );
+    discovery.sessions.sort_unstable_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.provider.label().cmp(right.provider.label()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    discovery
+}
+
+fn collect(discovery: &mut Discovery, provider: &str, result: Result<Vec<Session>>) {
+    match result {
+        Ok(mut sessions) => discovery.sessions.append(&mut sessions),
+        Err(error) => discovery.warnings.push(format!("{provider}: {error:#}")),
+    }
+}
+
+/// Starts the provider CLI and resumes the selected session.
+///
+/// # Errors
+///
+/// Returns an error when the provider process cannot be started.
+pub fn resume_session(session: &Session) -> Result<ExitStatus> {
+    resume_command(session)
+        .status()
+        .with_context(|| format!("failed to start {}", session.provider.label()))
+}
+
+fn resume_command(session: &Session) -> Command {
+    let mut command = match session.provider {
+        Provider::Codex => {
+            let mut command = Command::new("codex");
+            command.arg("resume").arg(&session.id);
+            command
+        }
+        Provider::OpenCode => {
+            let mut command = Command::new("opencode");
+            command.arg("--session").arg(&session.id);
+            if let Some(directory) = session.directory.as_ref().filter(|path| path.is_dir()) {
+                command.arg(directory);
+            }
+            command
+        }
+        Provider::Claude => {
+            let mut command = Command::new("claude");
+            command.arg("--resume").arg(&session.id);
+            command
+        }
+    };
+    if session.provider != Provider::OpenCode {
+        if let Some(directory) = session.directory.as_ref().filter(|path| path.is_dir()) {
+            command.current_dir(directory);
+        }
+    }
+    command
+}
+
+fn normalized_text(value: &str) -> Option<String> {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+fn timestamp_millis(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|time| time.timestamp_millis())
+        })
+}
+
+fn text_blocks(content: &serde_json::Value, accepted_types: &[&str]) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return normalized_text(text);
+    }
+    let text = content
+        .as_array()?
+        .iter()
+        .filter(|block| {
+            block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| accepted_types.contains(&kind))
+        })
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized_text(&text)
+}
+
+fn finish_session(
+    provider: Provider,
+    id: String,
+    title: Option<String>,
+    directory: Option<PathBuf>,
+    updated_at: i64,
+    user_messages: Vec<String>,
+    assistant_messages: Vec<String>,
+) -> Option<Session> {
+    Some(Session {
+        provider,
+        id,
+        title: title.and_then(|value| normalized_text(&value)),
+        directory,
+        updated_at,
+        first_user_message: user_messages.first()?.clone(),
+        last_user_message: user_messages.last()?.clone(),
+        last_assistant_message: assistant_messages.last().cloned(),
+        user_messages,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{resume_command, Provider, Session};
+
+    #[test]
+    fn builds_each_providers_resume_command() {
+        for (provider, program, arguments) in [
+            (Provider::Codex, "codex", vec!["resume", "session-1"]),
+            (
+                Provider::OpenCode,
+                "opencode",
+                vec!["--session", "session-1", "."],
+            ),
+            (Provider::Claude, "claude", vec!["--resume", "session-1"]),
+        ] {
+            let session = Session {
+                provider,
+                id: "session-1".to_owned(),
+                title: None,
+                directory: Some(PathBuf::from(".")),
+                updated_at: 0,
+                first_user_message: "first".to_owned(),
+                last_user_message: "last".to_owned(),
+                last_assistant_message: None,
+                user_messages: vec!["first".to_owned(), "last".to_owned()],
+            };
+
+            let command = resume_command(&session);
+
+            assert_eq!(command.get_program(), program);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
+        }
+    }
+
+    #[test]
+    fn stale_directory_does_not_prevent_resume() {
+        let session = Session {
+            provider: Provider::Claude,
+            id: "session-1".to_owned(),
+            title: None,
+            directory: Some(PathBuf::from("/path/that/does/not/exist")),
+            updated_at: 0,
+            first_user_message: "first".to_owned(),
+            last_user_message: "last".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["first".to_owned(), "last".to_owned()],
+        };
+
+        let command = resume_command(&session);
+
+        assert!(command.get_current_dir().is_none());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--resume", "session-1"]
+        );
+    }
+}
