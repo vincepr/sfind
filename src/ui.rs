@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::io::{self, IsTerminal};
 use std::path::{Component, Path};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -14,6 +15,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -139,6 +141,7 @@ struct App<'a> {
     search_inner: Rect,
     list_inner: Rect,
     detail_inner: Rect,
+    directory_areas: Vec<Rect>,
     range_inner: Rect,
     provider_inner: Rect,
     sort_areas: [Rect; 4],
@@ -175,6 +178,7 @@ impl<'a> App<'a> {
             search_inner: Rect::default(),
             list_inner: Rect::default(),
             detail_inner: Rect::default(),
+            directory_areas: Vec::new(),
             range_inner: Rect::default(),
             provider_inner: Rect::default(),
             sort_areas: [Rect::default(); 4],
@@ -318,14 +322,22 @@ impl<'a> App<'a> {
             .iter()
             .map(|line| line.width().max(1).div_ceil(detail_width))
             .sum::<usize>();
-        let detail_paragraph = Paragraph::new(detail)
-            .block(detail_block)
-            .wrap(Wrap { trim: false });
         let max_scroll = detail_height.saturating_sub(usize::from(self.detail_inner.height));
         self.detail_scroll = self
             .detail_scroll
             .min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
+        let has_directory = self
+            .selected_session()
+            .is_some_and(|session| session.directory.is_some());
+        let detail_paragraph = Paragraph::new(detail)
+            .block(detail_block)
+            .wrap(Wrap { trim: false });
         frame.render_widget(detail_paragraph.scroll((self.detail_scroll, 0)), panes[1]);
+        self.directory_areas = if has_directory {
+            modifier_areas(frame.buffer_mut(), self.detail_inner, Modifier::UNDERLINED)
+        } else {
+            Vec::new()
+        };
         let warnings = if self.warning_count == 0 {
             String::new()
         } else {
@@ -431,6 +443,10 @@ impl<'a> App<'a> {
                 self.filter();
                 return;
             }
+            if let Some(directory) = self.directory_at(mouse.column, mouse.row) {
+                open_directory_in_code(directory);
+                return;
+            }
         }
         match mouse.kind {
             MouseEventKind::Down(_)
@@ -489,6 +505,17 @@ impl<'a> App<'a> {
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {}
         }
+    }
+
+    fn directory_at(&self, column: u16, row: u16) -> Option<&Path> {
+        if !self
+            .directory_areas
+            .iter()
+            .any(|area| area.contains((column, row).into()))
+        {
+            return None;
+        }
+        self.selected_session()?.directory.as_deref()
     }
 
     fn filter(&mut self) {
@@ -923,6 +950,21 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
         (None, Some(effort)) => format!("{UNAVAILABLE} - {effort}"),
         (None, None) => UNAVAILABLE.to_owned(),
     };
+    let directory = session
+        .directory
+        .as_ref()
+        .map_or_else(|| UNAVAILABLE.to_owned(), |path| compact_path(path, 3));
+    let directory = field_with_style(
+        "Directory",
+        &directory,
+        if session.directory.is_some() {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        },
+    );
     let mut lines = vec![
         field("Provider", session.provider.label()),
         field("Updated", &full_time(session.updated_at)),
@@ -934,13 +976,7 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
                 title_max_chars,
             ),
         ),
-        field(
-            "Directory",
-            &session
-                .directory
-                .as_ref()
-                .map_or_else(|| UNAVAILABLE.to_owned(), |path| compact_path(path, 3)),
-        ),
+        directory,
         Line::raw(""),
         label("First user message", Color::LightBlue),
         Line::raw(truncate(&session.first_user_message, text_max_chars)),
@@ -989,6 +1025,42 @@ fn detail_cutoffs(stacked: bool) -> (usize, usize, usize) {
     (title, text, text * 2)
 }
 
+fn modifier_areas(buffer: &Buffer, area: Rect, modifier: Modifier) -> Vec<Rect> {
+    (area.top()..area.bottom())
+        .filter_map(|y| {
+            let mut columns = (area.left()..area.right())
+                .filter(|x| buffer[(*x, y)].style().add_modifier.contains(modifier));
+            let first = columns.next()?;
+            let last = columns.next_back().unwrap_or(first);
+            Some(Rect::new(
+                first,
+                y,
+                last.saturating_sub(first).saturating_add(1),
+                1,
+            ))
+        })
+        .collect()
+}
+
+fn code_directory_process(directory: &Path) -> Command {
+    let mut command = Command::new("code");
+    command
+        .arg(".")
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn open_directory_in_code(directory: &Path) {
+    if let Ok(mut child) = code_directory_process(directory).spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 fn compact_path(path: &Path, visible_parts: usize) -> String {
     let parts = path
         .components()
@@ -1005,12 +1077,16 @@ fn compact_path(path: &Path, visible_parts: usize) -> String {
 }
 
 fn field(label: &str, value: &str) -> Line<'static> {
+    field_with_style(label, value, Style::default())
+}
+
+fn field_with_style(label: &str, value: &str, value_style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{label}: "),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(value.to_owned()),
+        Span::styled(value.to_owned(), value_style),
     ])
 }
 
@@ -1124,18 +1200,19 @@ mod tests {
     };
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Direction, Rect};
-    use ratatui::style::Color;
-    use ratatui::widgets::Widget;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Widget, Wrap};
     use sfind::{Provider, Session, TokenUsage};
 
     use super::{
-        compact_path, day_range_label, day_range_start_date, delete_last_word, detail_cutoffs,
-        detail_lines, directory_color, filter_width, fuzzy_match, list_column_widths,
-        list_index_at, list_item_capacity, list_sort_areas, list_title_capacity, list_viewport,
-        next_day_range, next_provider_filter, padded_label, pane_direction, provider_short_label,
-        search_cursor, search_rank, search_scroll, session_list_block, session_meta_line,
-        session_order_index, sort_order_at, truncate, truncate_middle, App, DayRange, Selection,
-        SessionOrder,
+        code_directory_process, compact_path, day_range_label, day_range_start_date,
+        delete_last_word, detail_cutoffs, detail_lines, directory_color, filter_width, fuzzy_match,
+        list_column_widths, list_index_at, list_item_capacity, list_sort_areas,
+        list_title_capacity, list_viewport, modifier_areas, next_day_range, next_provider_filter,
+        padded_label, pane_direction, provider_short_label, search_cursor, search_rank,
+        search_scroll, session_list_block, session_meta_line, session_order_index, sort_order_at,
+        truncate, truncate_middle, App, DayRange, Selection, SessionOrder,
     };
 
     #[test]
@@ -1314,6 +1391,72 @@ mod tests {
         });
 
         assert_eq!(app.session_order, SessionOrder::Tokens);
+    }
+
+    #[test]
+    fn directory_hit_areas_follow_rendered_wrapping_and_scroll() {
+        let area = Rect::new(10, 5, 10, 3);
+        let mut buffer = Buffer::empty(area);
+        let lines = vec![
+            Line::raw("12345678901234567890"),
+            Line::styled(
+                "directoryvalue",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+        ];
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((2, 0))
+            .render(area, &mut buffer);
+
+        assert_eq!(
+            modifier_areas(&buffer, area, Modifier::UNDERLINED),
+            [Rect::new(10, 5, 10, 1), Rect::new(10, 6, 4, 1)]
+        );
+    }
+
+    #[test]
+    fn directory_click_resolves_the_selected_path() {
+        let sessions = [Session {
+            provider: Provider::Codex,
+            id: "session-1".to_owned(),
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            directory: Some(Path::new("/work/project").to_path_buf()),
+            updated_at: 0,
+            first_user_message: "message".to_owned(),
+            last_user_message: "message".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["message".to_owned()],
+            usage: None,
+        }];
+        let mut app = App::new(&sessions, 0);
+        app.directory_areas = vec![Rect::new(20, 8, 30, 2)];
+
+        let details = detail_lines(&sessions[0], false);
+        let directory_line = details
+            .iter()
+            .find(|line| line.to_string().starts_with("Directory:"))
+            .expect("directory detail line");
+        assert!(directory_line
+            .spans
+            .last()
+            .is_some_and(|span| span.style.add_modifier.contains(Modifier::UNDERLINED)));
+
+        assert_eq!(app.directory_at(25, 9), Some(Path::new("/work/project")));
+        assert_eq!(app.directory_at(19, 9), None);
+    }
+
+    #[test]
+    fn builds_vscode_directory_process() {
+        let directory = Path::new("/work/project");
+
+        let command = code_directory_process(directory);
+
+        assert_eq!(command.get_program(), "code");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["."]);
+        assert_eq!(command.get_current_dir(), Some(directory));
     }
 
     #[test]

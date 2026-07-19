@@ -14,6 +14,8 @@ with the arrow keys or mouse, inspect the first and latest sent
 messages, latest received message, and available input, output, and cache token counters, then press
 Enter to resume the session in its owning CLI. The Stats section shows the latest model and
 reasoning-effort setting recorded by the provider on one line; unavailable values are shown as `-`.
+Click the underlined directory in the details pane to open it in VS Code. If the `code` command is
+not available, the click has no effect.
 Session rows show their total token count at the right edge when space permits. On narrow terminals,
 the session list is placed above the details instead of beside it.
 
