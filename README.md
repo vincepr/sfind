@@ -11,7 +11,8 @@ cargo run
 Sessions are ordered by latest activity. Type to fuzzy-filter directories, provider titles,
 summaries, and user-authored messages. Directory matches rank ahead of message-only matches. Select
 with the arrow keys or mouse, inspect the first and latest sent
-messages and latest received message, then press Enter to resume the session in its owning CLI.
+messages, latest received message, and available input, output, and cache token counters, then press
+Enter to resume the session in its owning CLI.
 On narrow terminals, the session list is placed above the details instead of beside it.
 
 Use the range button in the top-right to cycle through all sessions, today, or the last 3, 7, or

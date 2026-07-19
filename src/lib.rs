@@ -33,6 +33,66 @@ impl Provider {
     }
 }
 
+/// Provider-independent token counters for a session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TokenUsage {
+    /// Non-cached input tokens.
+    pub input_tokens: u64,
+    /// Output tokens.
+    pub output_tokens: u64,
+    /// Tokens written to a provider cache.
+    pub cache_creation_tokens: u64,
+    /// Tokens read from a provider cache.
+    pub cache_read_tokens: u64,
+}
+
+impl TokenUsage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(other.cache_creation_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+    }
+
+    fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_sub(previous.cache_creation_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(previous.cache_read_tokens),
+        }
+    }
+
+    fn has_decreased_from(self, previous: Self) -> bool {
+        self.input_tokens < previous.input_tokens
+            || self.output_tokens < previous.output_tokens
+            || self.cache_creation_tokens < previous.cache_creation_tokens
+            || self.cache_read_tokens < previous.cache_read_tokens
+    }
+
+    fn accounted_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+}
+
+fn add_usage(total: &mut Option<TokenUsage>, usage: TokenUsage) {
+    match total {
+        Some(total) => total.add_assign(usage),
+        None => *total = Some(usage),
+    }
+}
+
 /// Provider-independent session data used by the finder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
@@ -54,6 +114,8 @@ pub struct Session {
     pub last_assistant_message: Option<String>,
     /// All user-authored messages; this is the only message content searched.
     pub user_messages: Vec<String>,
+    /// Token counters recorded by the provider, when available.
+    pub usage: Option<TokenUsage>,
 }
 
 impl Session {
@@ -362,6 +424,7 @@ fn finish_session(
     header: SessionHeader,
     user_messages: Vec<String>,
     last_assistant_message: Option<String>,
+    usage: Option<TokenUsage>,
 ) -> Option<Session> {
     Some(Session {
         provider: header.provider,
@@ -373,6 +436,7 @@ fn finish_session(
         last_user_message: user_messages.last()?.clone(),
         last_assistant_message,
         user_messages,
+        usage,
     })
 }
 
@@ -406,6 +470,7 @@ mod tests {
                 last_user_message: "last".to_owned(),
                 last_assistant_message: None,
                 user_messages: vec!["first".to_owned(), "last".to_owned()],
+                usage: None,
             };
 
             let command = session_process(&session, false);
@@ -427,6 +492,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned(), "last".to_owned()],
+            usage: None,
         };
 
         let command = session_process(&session, false);
@@ -450,6 +516,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: None,
         };
 
         let command = session_command(&session);
@@ -477,6 +544,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: None,
         };
 
         assert_eq!(
@@ -510,6 +578,7 @@ mod tests {
                 last_user_message: "last".to_owned(),
                 last_assistant_message: None,
                 user_messages: vec!["first".to_owned()],
+                usage: None,
             };
 
             let command = session_process(&session, true);
@@ -531,6 +600,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: None,
         };
 
         assert_eq!(fork_session_command(&session), "codex fork 'session-1'");

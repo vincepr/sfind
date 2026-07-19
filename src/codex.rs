@@ -9,8 +9,8 @@ use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::{
-    finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
-    SessionHeader,
+    add_usage, finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
+    SessionHeader, TokenUsage,
 };
 
 pub(crate) fn load(home: &Path) -> Result<ProviderDiscovery> {
@@ -113,6 +113,8 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
     let mut last_assistant_message = None;
     let mut fallback_users = Vec::new();
     let mut fallback_assistant_message = None;
+    let mut usage = None;
+    let mut previous_total_usage = TokenUsage::default();
 
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.with_context(|| format!("could not read {}", path.display()))?;
@@ -165,6 +167,31 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
                 }
             }
             Some("event_msg") => {
+                if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+                    let info = payload.get("info").unwrap_or(payload);
+                    let current_total = info.get("total_token_usage").and_then(parse_token_usage);
+                    let event_usage = match current_total {
+                        None => {
+                            let last = info.get("last_token_usage").and_then(parse_token_usage);
+                            if let Some(last) = last {
+                                previous_total_usage.add_assign(last);
+                            }
+                            last
+                        }
+                        Some(total) => {
+                            let delta = if total.has_decreased_from(previous_total_usage) {
+                                total
+                            } else {
+                                total.saturating_sub(previous_total_usage)
+                            };
+                            previous_total_usage = total;
+                            Some(delta)
+                        }
+                    };
+                    if let Some(event_usage) = event_usage {
+                        add_usage(&mut usage, event_usage);
+                    }
+                }
                 let message = payload
                     .get("message")
                     .and_then(Value::as_str)
@@ -196,8 +223,34 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
             },
             user_messages,
             last_assistant_message,
+            usage,
         )
     }))
+}
+
+fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
+    let input = token_count(value, &["input_tokens", "prompt_tokens"]);
+    let cache_read = token_count(value, &["cached_input_tokens", "cached_tokens"]).min(input);
+    let cache_creation = token_count(
+        value,
+        &["cache_write_input_tokens", "cache_creation_input_tokens"],
+    )
+    .min(input.saturating_sub(cache_read));
+    Some(TokenUsage {
+        input_tokens: input
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_creation),
+        output_tokens: token_count(value, &["output_tokens", "completion_tokens"]),
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cache_read,
+    })
+}
+
+fn token_count(value: &Value, names: &[&str]) -> u64 {
+    names
+        .iter()
+        .find_map(|name| value.get(name).and_then(Value::as_u64))
+        .unwrap_or_default()
 }
 
 fn is_injected_user_message(message: &str) -> bool {
@@ -246,6 +299,16 @@ mod tests {
                 r#"{"timestamp":"2026-01-01T10:02:00Z","type":"response_item","payload":{"type":"function_call","arguments":"secret tool text"}}"#,
                 "\n",
                 r#"{"timestamp":"2026-01-01T10:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The login flow is fixed."}]}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_creation_input_tokens":10,"output_tokens":20},"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_creation_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":80,"cache_creation_input_tokens":15,"output_tokens":30}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":999,"output_tokens":999},"total_token_usage":{"input_tokens":150,"cached_input_tokens":80,"cache_creation_input_tokens":15,"output_tokens":30}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160,"cached_input_tokens":80,"cache_creation_input_tokens":15,"output_tokens":32}}}}"#,
                 "\n"
             ),
         )
@@ -258,6 +321,11 @@ mod tests {
         assert_eq!(sessions[0].id, "codex-1");
         assert_eq!(sessions[0].title.as_deref(), Some("Auth cleanup"));
         assert_eq!(sessions[0].user_messages, ["Fix the login flow"]);
+        let usage = sessions[0].usage.expect("Codex token usage");
+        assert_eq!(usage.input_tokens, 65);
+        assert_eq!(usage.output_tokens, 32);
+        assert_eq!(usage.cache_creation_tokens, 15);
+        assert_eq!(usage.cache_read_tokens, 80);
         assert!(!sessions[0].search_text().contains("secret tool text"));
         assert!(!sessions[0].search_text().contains("private metadata"));
     }

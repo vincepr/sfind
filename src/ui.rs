@@ -710,7 +710,7 @@ fn search_rank(search_text: &str, path: &str, query: &str) -> Option<u8> {
 
 fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
     let (title_max_chars, text_max_chars, received_max_chars) = detail_cutoffs(stacked);
-    vec![
+    let mut lines = vec![
         field("Provider", session.provider.label()),
         field("Updated", &full_time(session.updated_at)),
         field("Session", &session.id),
@@ -746,7 +746,25 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
                 .unwrap_or("not available"),
             received_max_chars,
         )),
-    ]
+        Line::raw(""),
+        label("Stats", Color::LightGreen),
+    ];
+    match session.usage {
+        Some(usage) => {
+            lines.push(Line::raw(format!(
+                "In {}  Out {}",
+                format_number(usage.input_tokens),
+                format_number(usage.output_tokens)
+            )));
+            lines.push(Line::raw(format!(
+                "Cache create {}  Cache read {}",
+                format_number(usage.cache_creation_tokens),
+                format_number(usage.cache_read_tokens)
+            )));
+        }
+        None => lines.push(Line::raw("not available")),
+    }
+    lines
 }
 
 fn detail_cutoffs(stacked: bool) -> (usize, usize, usize) {
@@ -838,6 +856,18 @@ fn full_time(timestamp: i64) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+fn format_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut result = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index != 0 && (digits.len() - index).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(character);
+    }
+    result
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
@@ -876,14 +906,14 @@ mod tests {
     use chrono::NaiveDate;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
-    use sfind::{Provider, Session};
+    use sfind::{Provider, Session, TokenUsage};
 
     use super::{
         compact_path, day_range_label, day_range_start_date, delete_last_word, detail_cutoffs,
-        directory_color, filter_width, fuzzy_match, list_index_at, list_item_capacity,
-        list_title_capacity, list_viewport, next_day_range, next_provider_filter, padded_label,
-        pane_direction, provider_short_label, search_cursor, search_rank, search_scroll, truncate,
-        truncate_middle, App, DayRange, Selection,
+        detail_lines, directory_color, filter_width, fuzzy_match, list_index_at,
+        list_item_capacity, list_title_capacity, list_viewport, next_day_range,
+        next_provider_filter, padded_label, pane_direction, provider_short_label, search_cursor,
+        search_rank, search_scroll, truncate, truncate_middle, App, DayRange, Selection,
     };
 
     #[test]
@@ -992,6 +1022,7 @@ mod tests {
             last_user_message: "message".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["message".to_owned()],
+            usage: None,
         };
         let sessions = [
             session("a", Provider::Codex),
@@ -1023,6 +1054,40 @@ mod tests {
 
         assert_eq!(preview, "012345...uvwxyz");
         assert_eq!(preview.chars().count(), 15);
+    }
+
+    #[test]
+    fn detail_panel_shows_compact_token_stats() {
+        let session = Session {
+            provider: Provider::OpenCode,
+            id: "session-1".to_owned(),
+            title: None,
+            directory: None,
+            updated_at: 0,
+            first_user_message: "first".to_owned(),
+            last_user_message: "last".to_owned(),
+            last_assistant_message: Some("response".to_owned()),
+            user_messages: vec!["first".to_owned()],
+            usage: Some(TokenUsage {
+                input_tokens: 1_299_667,
+                output_tokens: 171_958,
+                cache_creation_tokens: 88_966,
+                cache_read_tokens: 61_227_008,
+            }),
+        };
+
+        let details = detail_lines(&session, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(details.iter().any(|line| line == "Stats:"));
+        assert!(details
+            .iter()
+            .any(|line| line == "In 1,299,667  Out 171,958"));
+        assert!(details
+            .iter()
+            .any(|line| line == "Cache create 88,966  Cache read 61,227,008"));
     }
 
     #[test]
@@ -1088,6 +1153,7 @@ mod tests {
             last_user_message: "auth migration".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["auth migration".to_owned()],
+            usage: None,
         }];
         let mut app = App::new(&sessions, 0);
         app.query = "auth migration".to_owned();
@@ -1141,6 +1207,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: None,
         }];
         let mut app = App::new(&sessions, 0);
 
@@ -1161,6 +1228,7 @@ mod tests {
             last_user_message: "last".to_owned(),
             last_assistant_message: None,
             user_messages: vec!["first".to_owned()],
+            usage: None,
         }];
         let mut app = App::new(&sessions, 0);
 

@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use crate::{finish_session, normalized_text, Provider, ProviderDiscovery, Session, SessionHeader};
+use crate::{
+    add_usage, finish_session, normalized_text, Provider, ProviderDiscovery, Session,
+    SessionHeader, TokenUsage,
+};
 
 #[derive(Debug)]
 struct OpenCodeSession {
@@ -14,6 +17,9 @@ struct OpenCodeSession {
     updated_at: i64,
     user_messages: Vec<String>,
     last_assistant_message: Option<String>,
+    usage: Option<TokenUsage>,
+    message_id: Option<String>,
+    message_role: Option<String>,
 }
 
 pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
@@ -27,7 +33,7 @@ pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
     .with_context(|| format!("could not open {} read-only", path.display()))?;
     let mut statement = connection
         .prepare(
-            "SELECT s.id, s.title, s.directory, s.time_updated, m.data, p.data
+            "SELECT s.id, s.title, s.directory, s.time_updated, m.id, m.data, p.data
              FROM session s
              LEFT JOIN message m ON m.session_id = s.id
              LEFT JOIN part p ON p.message_id = m.id
@@ -69,28 +75,49 @@ pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
                 updated_at: updated_at.unwrap_or_default(),
                 user_messages: Vec::new(),
                 last_assistant_message: None,
+                usage: None,
+                message_id: None,
+                message_role: None,
             });
         }
         let Some(session) = current.as_mut() else {
             continue;
         };
-        let (message_data, part_data): (Option<String>, Option<String>) =
+        let (message_id, message_data): (Option<String>, Option<String>) =
             match (row.get(4), row.get(5)) {
-                (Ok(message_data), Ok(part_data)) => (message_data, part_data),
+                (Ok(message_id), Ok(message_data)) => (message_id, message_data),
                 (Err(_), _) | (_, Err(_)) => {
                     malformed_records += 1;
                     continue;
                 }
             };
-        let (Some(message_data), Some(part_data)) = (message_data, part_data) else {
-            continue;
-        };
-        let message = match serde_json::from_str::<Value>(&message_data) {
-            Ok(message) => message,
+        if session.message_id != message_id {
+            session.message_id = message_id;
+            session.message_role = None;
+            if let Some(message_data) = message_data.as_deref() {
+                match serde_json::from_str::<Value>(message_data) {
+                    Ok(message) => {
+                        session.message_role = message
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        if let Some(message_usage) = message_usage(&message) {
+                            add_usage(&mut session.usage, message_usage);
+                        }
+                    }
+                    Err(_) => malformed_records += 1,
+                }
+            }
+        }
+        let part_data: Option<String> = match row.get(6) {
+            Ok(part_data) => part_data,
             Err(_) => {
                 malformed_records += 1;
                 continue;
             }
+        };
+        let Some(part_data) = part_data else {
+            continue;
         };
         let part = match serde_json::from_str::<Value>(&part_data) {
             Ok(part) => part,
@@ -112,7 +139,7 @@ pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
         else {
             continue;
         };
-        match message.get("role").and_then(Value::as_str) {
+        match session.message_role.as_deref() {
             Some("user") => session.user_messages.push(text),
             Some("assistant") => session.last_assistant_message = Some(text),
             _ => {}
@@ -142,9 +169,26 @@ fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) 
         },
         session.user_messages,
         session.last_assistant_message,
+        session.usage,
     ) {
         sessions.push(session);
     }
+}
+
+fn message_usage(message: &Value) -> Option<TokenUsage> {
+    let tokens = message.get("tokens")?;
+    let cache = tokens.get("cache");
+    Some(TokenUsage {
+        input_tokens: token_count(tokens, "input"),
+        output_tokens: token_count(tokens, "output")
+            .saturating_add(token_count(tokens, "reasoning")),
+        cache_creation_tokens: cache.map_or(0, |cache| token_count(cache, "write")),
+        cache_read_tokens: cache.map_or(0, |cache| token_count(cache, "read")),
+    })
+}
+
+fn token_count(value: &Value, name: &str) -> u64 {
+    value.get(name).and_then(Value::as_u64).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -220,6 +264,33 @@ mod tests {
             .expect("synthetic part");
         connection
             .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "msg_2",
+                    "ses_1",
+                    200,
+                    r#"{"role":"assistant","tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":30,"write":10}}}"#
+                ],
+            )
+            .expect("assistant message");
+        for (id, created, text) in [
+            ("part_4", 201, "First response part"),
+            ("part_5", 202, "Final response part"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        "msg_2",
+                        created,
+                        format!(r#"{{"type":"text","text":"{text}"}}"#)
+                    ],
+                )
+                .expect("assistant part");
+        }
+        connection
+            .execute(
                 "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
                 params!["ses_child", "Subagent", "/work/api", 2000, "ses_1"],
             )
@@ -231,6 +302,11 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].user_messages, ["Fix API auth"]);
         assert_eq!(sessions[0].title.as_deref(), Some("API cleanup"));
+        let usage = sessions[0].usage.expect("OpenCode token usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.cache_creation_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 30);
         assert!(!sessions[0].search_text().contains("hidden tool"));
         assert!(!sessions[0].search_text().contains("generated prompt"));
     }
