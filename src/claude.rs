@@ -107,7 +107,7 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
                     identified_usage
                         .entry((message_id.to_owned(), request_id))
                         .and_modify(|current: &mut TokenUsage| {
-                            if message_usage.accounted_tokens() > current.accounted_tokens() {
+                            if message_usage.total_tokens() > current.total_tokens() {
                                 *current = message_usage;
                             }
                         })

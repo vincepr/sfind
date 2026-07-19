@@ -13,7 +13,8 @@ summaries, and user-authored messages. Directory matches rank ahead of message-o
 with the arrow keys or mouse, inspect the first and latest sent
 messages, latest received message, and available input, output, and cache token counters, then press
 Enter to resume the session in its owning CLI.
-On narrow terminals, the session list is placed above the details instead of beside it.
+Session rows show their total token count at the right edge when space permits. On narrow terminals,
+the session list is placed above the details instead of beside it.
 
 Use the range button in the top-right to cycle through all sessions, today, or the last 3, 7, or
 30 local calendar days. `All` is selected by default. The CLI button beside it cycles through all

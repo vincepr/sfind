@@ -47,6 +47,15 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Returns input, output, cache creation, and cache read tokens combined.
+    #[must_use]
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
     fn add_assign(&mut self, other: Self) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
@@ -76,13 +85,6 @@ impl TokenUsage {
             || self.output_tokens < previous.output_tokens
             || self.cache_creation_tokens < previous.cache_creation_tokens
             || self.cache_read_tokens < previous.cache_read_tokens
-    }
-
-    fn accounted_tokens(self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_creation_tokens)
-            .saturating_add(self.cache_read_tokens)
     }
 }
 

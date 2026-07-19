@@ -16,7 +16,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use sfind::{Provider, Session};
 
@@ -250,22 +252,8 @@ impl<'a> App<'a> {
                 .title
                 .as_deref()
                 .unwrap_or(&session.first_user_message);
-            let directory = session.directory.as_ref().map_or_else(
-                || "directory unknown".to_owned(),
-                |path| compact_path(path, 3),
-            );
             ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<8}", session.provider.label()),
-                        Style::default().fg(provider_color(session.provider.label())),
-                    ),
-                    Span::raw(format!(" {}  ", compact_time(session.updated_at))),
-                    Span::styled(
-                        directory,
-                        Style::default().fg(directory_color(session.directory.as_deref())),
-                    ),
-                ]),
+                session_meta_line(session, self.list_inner.width.saturating_sub(2)),
                 Line::raw(format!("  {}", truncate(title, title_max_chars))),
             ])
         });
@@ -280,7 +268,8 @@ impl<'a> App<'a> {
                     })
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("> ");
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always);
         let local_selection = self
             .list_state
             .selected()
@@ -629,6 +618,80 @@ fn list_title_capacity(width: u16) -> usize {
     usize::from(width).saturating_sub(4)
 }
 
+fn session_meta_line(session: &Session, width: u16) -> Line<'static> {
+    let provider = format!("{:<8}", session.provider.label());
+    let time = format!(" {}  ", compact_time(session.updated_at));
+    let directory = session.directory.as_ref().map_or_else(
+        || "directory unknown".to_owned(),
+        |path| compact_path(path, 3),
+    );
+    let mut spans = vec![
+        Span::styled(
+            provider.clone(),
+            Style::default().fg(provider_color(session.provider.label())),
+        ),
+        Span::raw(time.clone()),
+    ];
+    let Some(total) = session
+        .usage
+        .map(|usage| format_number(usage.total_tokens()))
+    else {
+        spans.push(Span::styled(
+            directory,
+            Style::default().fg(directory_color(session.directory.as_deref())),
+        ));
+        return Line::from(spans);
+    };
+    let available = usize::from(width);
+    let prefix_width = Line::from(format!("{provider}{time}")).width();
+    let total_width = total.len();
+    const MIN_DIRECTORY_WIDTH: usize = 3;
+    if available < prefix_width + total_width + MIN_DIRECTORY_WIDTH + 1 {
+        spans.push(Span::styled(
+            directory,
+            Style::default().fg(directory_color(session.directory.as_deref())),
+        ));
+        return Line::from(spans);
+    }
+    let directory_width = available - prefix_width - total_width - 1;
+    let directory = truncate_to_width(&directory, directory_width);
+    let used_width = prefix_width + Line::from(directory.as_str()).width() + total_width;
+    spans.push(Span::styled(
+        directory,
+        Style::default().fg(directory_color(session.directory.as_deref())),
+    ));
+    spans.push(Span::raw(" ".repeat(available.saturating_sub(used_width))));
+    spans.push(Span::styled(
+        total,
+        Style::default()
+            .fg(provider_color(session.provider.label()))
+            .add_modifier(Modifier::BOLD),
+    ));
+    Line::from(spans)
+}
+
+fn truncate_to_width(value: &str, max_width: usize) -> String {
+    if Line::from(value).width() <= max_width {
+        return value.to_owned();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let retained_width = max_width - 3;
+    let mut result = String::new();
+    let mut width = 0_usize;
+    for character in value.chars() {
+        let character_width = Line::from(character.to_string()).width();
+        if width.saturating_add(character_width) > retained_width {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push_str("...");
+    result
+}
+
 fn delete_last_word(value: &mut String) {
     while value.chars().next_back().is_some_and(char::is_whitespace) {
         value.pop();
@@ -760,6 +823,10 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
                 "Cache create {}  Cache read {}",
                 format_number(usage.cache_creation_tokens),
                 format_number(usage.cache_read_tokens)
+            )));
+            lines.push(Line::raw(format!(
+                "Total {}",
+                format_number(usage.total_tokens())
             )));
         }
         None => lines.push(Line::raw("not available")),
@@ -906,6 +973,7 @@ mod tests {
     use chrono::NaiveDate;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Direction;
+    use ratatui::style::Color;
     use sfind::{Provider, Session, TokenUsage};
 
     use super::{
@@ -913,7 +981,8 @@ mod tests {
         detail_lines, directory_color, filter_width, fuzzy_match, list_index_at,
         list_item_capacity, list_title_capacity, list_viewport, next_day_range,
         next_provider_filter, padded_label, pane_direction, provider_short_label, search_cursor,
-        search_rank, search_scroll, truncate, truncate_middle, App, DayRange, Selection,
+        search_rank, search_scroll, session_meta_line, truncate, truncate_middle, App, DayRange,
+        Selection,
     };
 
     #[test]
@@ -1088,6 +1157,43 @@ mod tests {
         assert!(details
             .iter()
             .any(|line| line == "Cache create 88,966  Cache read 61,227,008"));
+        assert!(details.iter().any(|line| line == "Total 62,787,599"));
+
+        let meta = session_meta_line(&session, 80);
+        assert_eq!(meta.width(), 80);
+        assert_eq!(
+            meta.spans.last().and_then(|span| span.style.fg),
+            Some(Color::Cyan)
+        );
+        assert!(meta.to_string().ends_with("62,787,599"));
+        assert!(meta.to_string().contains("directory unknown"));
+    }
+
+    #[test]
+    fn narrow_session_rows_keep_left_metadata_when_total_does_not_fit() {
+        let session = Session {
+            provider: Provider::Codex,
+            id: "session-1".to_owned(),
+            title: None,
+            directory: Some(Path::new("/work/project").to_path_buf()),
+            updated_at: 0,
+            first_user_message: "first".to_owned(),
+            last_user_message: "last".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["first".to_owned()],
+            usage: Some(TokenUsage {
+                input_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                cache_creation_tokens: u64::MAX,
+                cache_read_tokens: u64::MAX,
+            }),
+        };
+
+        let meta = session_meta_line(&session, 30).to_string();
+
+        assert!(meta.starts_with("codex"));
+        assert!(meta.contains("work/project"));
+        assert!(!meta.ends_with("18,446,744,073,709,551,615"));
     }
 
     #[test]
