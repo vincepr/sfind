@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::io::{self, IsTerminal};
 use std::path::{Component, Path};
 use std::time::Duration;
@@ -6,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Days, Local, NaiveDate, TimeZone};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -29,11 +30,20 @@ const LIST_ITEM_HEIGHT: usize = 2;
 const RANGE_FILTER_WIDTH: u16 = 12;
 const PROVIDER_FILTER_WIDTH: u16 = 12;
 const SEARCH_MIN_WIDTH: u16 = 8;
+const UNAVAILABLE: &str = "-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DayRange {
     All,
     Days(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionOrder {
+    Date,
+    Provider,
+    Location,
+    Tokens,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,10 +141,12 @@ struct App<'a> {
     detail_inner: Rect,
     range_inner: Rect,
     provider_inner: Rect,
+    sort_areas: [Rect; 4],
     detail_scroll: u16,
     fork_mode: bool,
     day_range: DayRange,
     provider_filter: Option<Provider>,
+    session_order: SessionOrder,
     warning_count: usize,
 }
 
@@ -165,10 +177,12 @@ impl<'a> App<'a> {
             detail_inner: Rect::default(),
             range_inner: Rect::default(),
             provider_inner: Rect::default(),
+            sort_areas: [Rect::default(); 4],
             detail_scroll: 0,
             fork_mode: false,
             day_range: DayRange::All,
             provider_filter: None,
+            session_order: SessionOrder::Date,
             warning_count,
         }
     }
@@ -226,18 +240,14 @@ impl<'a> App<'a> {
             .block(provider_block),
             top[2],
         );
-
         let pane_direction = pane_direction(sections[1].width);
         let panes = Layout::default()
             .direction(pane_direction)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(sections[1]);
-        let list_block = Block::default().borders(Borders::ALL).title(format!(
-            " Sessions ({}/{}) ",
-            self.visible.len(),
-            self.sessions.len()
-        ));
+        let list_block = session_list_block(self.visible.len(), self.sessions.len());
         self.list_inner = list_block.inner(panes[0]);
+        self.sort_areas = list_sort_areas(panes[0], self.list_inner);
         let (list_offset, list_end) = list_viewport(
             self.list_state.selected(),
             self.list_state.offset(),
@@ -276,6 +286,23 @@ impl<'a> App<'a> {
             .map(|selected| selected.saturating_sub(list_offset));
         let mut local_state = ListState::default().with_selected(local_selection);
         frame.render_stateful_widget(list, panes[0], &mut local_state);
+        let active_sort_area = self.sort_areas[session_order_index(self.session_order)];
+        if active_sort_area.width != 0 {
+            let indicator = Rect::new(
+                active_sort_area.x + active_sort_area.width / 2,
+                active_sort_area.y,
+                1,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new("▼").style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                indicator,
+            );
+        }
 
         let detail = self
             .selected_session()
@@ -398,6 +425,13 @@ impl<'a> App<'a> {
     }
 
     fn mouse(&mut self, mouse: MouseEvent) {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some(order) = sort_order_at(&self.sort_areas, mouse.column, mouse.row) {
+                self.session_order = order;
+                self.filter();
+                return;
+            }
+        }
         match mouse.kind {
             MouseEventKind::Down(_)
                 if self
@@ -479,7 +513,17 @@ impl<'a> App<'a> {
             })
             .collect::<Vec<_>>();
         matches.sort_unstable_by(|left, right| {
-            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| {
+                    compare_sessions(
+                        &self.sessions[left.1],
+                        &self.sessions[right.1],
+                        self.session_order,
+                    )
+                })
+                .then_with(|| left.1.cmp(&right.1))
         });
         self.visible = matches.into_iter().map(|(_, index)| index).collect();
         self.list_state
@@ -516,6 +560,71 @@ impl<'a> App<'a> {
     fn selected_session(&self) -> Option<&Session> {
         self.selected_index()
             .and_then(|index| self.sessions.get(index))
+    }
+}
+
+fn session_order_index(order: SessionOrder) -> usize {
+    match order {
+        SessionOrder::Provider => 0,
+        SessionOrder::Date => 1,
+        SessionOrder::Location => 2,
+        SessionOrder::Tokens => 3,
+    }
+}
+
+fn sort_order_at(areas: &[Rect; 4], column: u16, row: u16) -> Option<SessionOrder> {
+    let point = (column, row).into();
+    [
+        SessionOrder::Provider,
+        SessionOrder::Date,
+        SessionOrder::Location,
+        SessionOrder::Tokens,
+    ]
+    .into_iter()
+    .zip(areas)
+    .find_map(|(order, area)| area.contains(point).then_some(order))
+}
+
+fn compare_sessions(left: &Session, right: &Session, order: SessionOrder) -> Ordering {
+    let primary = match order {
+        SessionOrder::Date => newest_first(left, right),
+        SessionOrder::Provider => left.provider.label().cmp(right.provider.label()),
+        SessionOrder::Location => {
+            optional_first(left.directory.as_deref(), right.directory.as_deref())
+        }
+        SessionOrder::Tokens => compare_token_totals(left, right),
+    };
+    primary
+        .then_with(|| {
+            if order == SessionOrder::Date {
+                Ordering::Equal
+            } else {
+                newest_first(left, right)
+            }
+        })
+        .then_with(|| left.provider.label().cmp(right.provider.label()))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn newest_first(left: &Session, right: &Session) -> Ordering {
+    right.updated_at.cmp(&left.updated_at)
+}
+
+fn compare_token_totals(left: &Session, right: &Session) -> Ordering {
+    match (left.usage, right.usage) {
+        (Some(left), Some(right)) => right.total_tokens().cmp(&left.total_tokens()),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn optional_first<T: Ord + ?Sized>(left: Option<&T>, right: Option<&T>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -618,56 +727,88 @@ fn list_title_capacity(width: u16) -> usize {
     usize::from(width).saturating_sub(4)
 }
 
+fn session_list_block(visible: usize, total: usize) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title_bottom(Line::raw(format!(" Sessions ({visible}/{total}) ")).right_aligned())
+}
+
+fn list_sort_areas(outer: Rect, inner: Rect) -> [Rect; 4] {
+    let start = inner.x.saturating_add(2).min(inner.right());
+    let available = inner.right().saturating_sub(start);
+    let widths = list_column_widths(available);
+    let mut x = start;
+    std::array::from_fn(|index| {
+        let area = Rect::new(x, outer.y, widths[index], 1);
+        x = x.saturating_add(widths[index]);
+        area
+    })
+}
+
+fn list_column_widths(available: u16) -> [u16; 4] {
+    if available >= 39 {
+        return [8, 14, available - 36, 14];
+    }
+    let base = available / 4;
+    let mut widths = [base; 4];
+    for width in widths.iter_mut().take(usize::from(available % 4)) {
+        *width += 1;
+    }
+    widths
+}
+
 fn session_meta_line(session: &Session, width: u16) -> Line<'static> {
-    let provider = format!("{:<8}", session.provider.label());
-    let time = format!(" {}  ", compact_time(session.updated_at));
-    let directory = session.directory.as_ref().map_or_else(
-        || "directory unknown".to_owned(),
-        |path| compact_path(path, 3),
+    let columns = list_column_widths(width);
+    let provider = fit_left(session.provider.label(), columns[0]);
+    let time = fit_left(
+        &format!(" {}  ", compact_time(session.updated_at)),
+        columns[1],
     );
-    let mut spans = vec![
-        Span::styled(
-            provider.clone(),
-            Style::default().fg(provider_color(session.provider.label())),
-        ),
-        Span::raw(time.clone()),
-    ];
-    let Some(total) = session
+    let directory = session
+        .directory
+        .as_ref()
+        .map_or_else(|| UNAVAILABLE.to_owned(), |path| compact_path(path, 3));
+    let directory = fit_left(&directory, columns[2]);
+    let total = session
         .usage
         .map(|usage| format_number(usage.total_tokens()))
-    else {
-        spans.push(Span::styled(
+        .map_or_else(
+            || " ".repeat(usize::from(columns[3])),
+            |total| fit_right(&total, columns[3]),
+        );
+    Line::from(vec![
+        Span::styled(
+            provider,
+            Style::default().fg(provider_color(session.provider.label())),
+        ),
+        Span::raw(time),
+        Span::styled(
             directory,
             Style::default().fg(directory_color(session.directory.as_deref())),
-        ));
-        return Line::from(spans);
-    };
-    let available = usize::from(width);
-    let prefix_width = Line::from(format!("{provider}{time}")).width();
-    let total_width = total.len();
-    const MIN_DIRECTORY_WIDTH: usize = 3;
-    if available < prefix_width + total_width + MIN_DIRECTORY_WIDTH + 1 {
-        spans.push(Span::styled(
-            directory,
-            Style::default().fg(directory_color(session.directory.as_deref())),
-        ));
-        return Line::from(spans);
+        ),
+        Span::styled(
+            total,
+            Style::default()
+                .fg(provider_color(session.provider.label()))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn fit_left(value: &str, width: u16) -> String {
+    let width = usize::from(width);
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(Line::from(value.as_str()).width());
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn fit_right(value: &str, width: u16) -> String {
+    let width = usize::from(width);
+    let value_width = Line::from(value).width();
+    if value_width > width {
+        return " ".repeat(width);
     }
-    let directory_width = available - prefix_width - total_width - 1;
-    let directory = truncate_to_width(&directory, directory_width);
-    let used_width = prefix_width + Line::from(directory.as_str()).width() + total_width;
-    spans.push(Span::styled(
-        directory,
-        Style::default().fg(directory_color(session.directory.as_deref())),
-    ));
-    spans.push(Span::raw(" ".repeat(available.saturating_sub(used_width))));
-    spans.push(Span::styled(
-        total,
-        Style::default()
-            .fg(provider_color(session.provider.label()))
-            .add_modifier(Modifier::BOLD),
-    ));
-    Line::from(spans)
+    format!("{}{value}", " ".repeat(width - value_width))
 }
 
 fn truncate_to_width(value: &str, max_width: usize) -> String {
@@ -773,6 +914,15 @@ fn search_rank(search_text: &str, path: &str, query: &str) -> Option<u8> {
 
 fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
     let (title_max_chars, text_max_chars, received_max_chars) = detail_cutoffs(stacked);
+    let model = match (
+        session.model.as_deref(),
+        session.reasoning_effort.as_deref(),
+    ) {
+        (Some(model), Some(effort)) => format!("{model} - {effort}"),
+        (Some(model), None) => model.to_owned(),
+        (None, Some(effort)) => format!("{UNAVAILABLE} - {effort}"),
+        (None, None) => UNAVAILABLE.to_owned(),
+    };
     let mut lines = vec![
         field("Provider", session.provider.label()),
         field("Updated", &full_time(session.updated_at)),
@@ -780,7 +930,7 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
         field(
             "Title",
             &truncate(
-                session.title.as_deref().unwrap_or("not provided"),
+                session.title.as_deref().unwrap_or(UNAVAILABLE),
                 title_max_chars,
             ),
         ),
@@ -789,7 +939,7 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
             &session
                 .directory
                 .as_ref()
-                .map_or_else(|| "not provided".to_owned(), |path| compact_path(path, 3)),
+                .map_or_else(|| UNAVAILABLE.to_owned(), |path| compact_path(path, 3)),
         ),
         Line::raw(""),
         label("First user message", Color::LightBlue),
@@ -806,30 +956,28 @@ fn detail_lines(session: &Session, stacked: bool) -> Vec<Line<'static>> {
             session
                 .last_assistant_message
                 .as_deref()
-                .unwrap_or("not available"),
+                .unwrap_or(UNAVAILABLE),
             received_max_chars,
         )),
         Line::raw(""),
         label("Stats", Color::LightGreen),
+        field("Model", &model),
     ];
     match session.usage {
         Some(usage) => {
             lines.push(Line::raw(format!(
-                "In {}  Out {}",
+                "In {}  Out {}  Total {}",
                 format_number(usage.input_tokens),
-                format_number(usage.output_tokens)
+                format_number(usage.output_tokens),
+                format_number(usage.total_tokens())
             )));
             lines.push(Line::raw(format!(
                 "Cache create {}  Cache read {}",
                 format_number(usage.cache_creation_tokens),
                 format_number(usage.cache_read_tokens)
             )));
-            lines.push(Line::raw(format!(
-                "Total {}",
-                format_number(usage.total_tokens())
-            )));
         }
-        None => lines.push(Line::raw("not available")),
+        None => lines.push(Line::raw(UNAVAILABLE)),
     }
     lines
 }
@@ -910,7 +1058,7 @@ fn directory_color(directory: Option<&Path>) -> Color {
 fn compact_time(timestamp: i64) -> String {
     DateTime::from_timestamp_millis(timestamp)
         .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .unwrap_or_else(|| UNAVAILABLE.to_owned())
 }
 
 fn full_time(timestamp: i64) -> String {
@@ -920,7 +1068,7 @@ fn full_time(timestamp: i64) -> String {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string()
         })
-        .unwrap_or_else(|| "unknown".to_owned())
+        .unwrap_or_else(|| UNAVAILABLE.to_owned())
 }
 
 fn format_number(value: u64) -> String {
@@ -971,18 +1119,23 @@ mod tests {
     use std::path::Path;
 
     use chrono::NaiveDate;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::layout::Direction;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::{Direction, Rect};
     use ratatui::style::Color;
+    use ratatui::widgets::Widget;
     use sfind::{Provider, Session, TokenUsage};
 
     use super::{
         compact_path, day_range_label, day_range_start_date, delete_last_word, detail_cutoffs,
-        detail_lines, directory_color, filter_width, fuzzy_match, list_index_at,
-        list_item_capacity, list_title_capacity, list_viewport, next_day_range,
-        next_provider_filter, padded_label, pane_direction, provider_short_label, search_cursor,
-        search_rank, search_scroll, session_meta_line, truncate, truncate_middle, App, DayRange,
-        Selection,
+        detail_lines, directory_color, filter_width, fuzzy_match, list_column_widths,
+        list_index_at, list_item_capacity, list_sort_areas, list_title_capacity, list_viewport,
+        next_day_range, next_provider_filter, padded_label, pane_direction, provider_short_label,
+        search_cursor, search_rank, search_scroll, session_list_block, session_meta_line,
+        session_order_index, sort_order_at, truncate, truncate_middle, App, DayRange, Selection,
+        SessionOrder,
     };
 
     #[test]
@@ -1080,11 +1233,145 @@ mod tests {
     }
 
     #[test]
+    fn sort_areas_follow_list_columns_and_remain_usable_when_narrow() {
+        let outer = Rect::new(10, 5, 82, 20);
+        let inner = Rect::new(11, 6, 80, 18);
+
+        let areas = list_sort_areas(outer, inner);
+
+        assert_eq!(areas.map(|area| area.width), [8, 14, 42, 14]);
+        assert!(areas.iter().all(|area| area.y == outer.y));
+        assert_eq!(session_order_index(SessionOrder::Provider), 0);
+        assert_eq!(session_order_index(SessionOrder::Date), 1);
+        assert_eq!(session_order_index(SessionOrder::Location), 2);
+        assert_eq!(session_order_index(SessionOrder::Tokens), 3);
+
+        let narrow = list_sort_areas(Rect::new(0, 0, 20, 5), Rect::new(1, 1, 18, 3));
+        assert_eq!(narrow.map(|area| area.width), list_column_widths(16));
+        assert!(narrow.iter().all(|area| area.width > 0));
+    }
+
+    #[test]
+    fn session_count_is_rendered_on_the_bottom_right_border() {
+        let area = Rect::new(0, 0, 30, 4);
+        let mut buffer = Buffer::empty(area);
+
+        session_list_block(23, 23).render(area, &mut buffer);
+
+        let row = |y| {
+            (area.left()..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(!row(area.top()).contains("Sessions"));
+        assert!(row(area.bottom() - 1).contains("Sessions (23/23)"));
+    }
+
+    #[test]
+    fn clicking_list_border_selects_that_columns_sort() {
+        let sessions = [Session {
+            provider: Provider::Codex,
+            id: "a".to_owned(),
+            title: None,
+            model: Some("gpt".to_owned()),
+            reasoning_effort: None,
+            directory: None,
+            updated_at: 0,
+            first_user_message: "message".to_owned(),
+            last_user_message: "message".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["message".to_owned()],
+            usage: None,
+        }];
+        let mut app = App::new(&sessions, 0);
+        app.sort_areas = list_sort_areas(Rect::new(10, 2, 82, 20), Rect::new(11, 3, 80, 18));
+
+        for expected in [
+            SessionOrder::Provider,
+            SessionOrder::Date,
+            SessionOrder::Location,
+            SessionOrder::Tokens,
+        ] {
+            let area = app.sort_areas[session_order_index(expected)];
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.session_order, expected);
+            assert_eq!(
+                sort_order_at(&app.sort_areas, area.x, area.y),
+                Some(expected)
+            );
+        }
+
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: app.sort_areas[0].x,
+            row: app.sort_areas[0].y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.session_order, SessionOrder::Tokens);
+    }
+
+    #[test]
+    fn selected_order_sorts_with_newest_date_as_the_tie_breaker() {
+        let session = |id: &str,
+                       provider: Provider,
+                       directory: Option<&str>,
+                       tokens: Option<u64>,
+                       updated_at: i64| Session {
+            provider,
+            id: id.to_owned(),
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            directory: directory.map(Into::into),
+            updated_at,
+            first_user_message: "message".to_owned(),
+            last_user_message: "message".to_owned(),
+            last_assistant_message: None,
+            user_messages: vec!["message".to_owned()],
+            usage: tokens.map(|tokens| TokenUsage {
+                input_tokens: tokens,
+                ..TokenUsage::default()
+            }),
+        };
+        let sessions = [
+            session("c", Provider::Claude, Some("/a"), Some(200), 100),
+            session("d", Provider::Codex, None, None, 400),
+            session("b", Provider::OpenCode, Some("/b"), Some(100), 200),
+            session("a", Provider::Codex, Some("/z"), Some(100), 300),
+        ];
+        let mut app = App::new(&sessions, 0);
+
+        for (order, expected) in [
+            (SessionOrder::Date, ["d", "a", "b", "c"]),
+            (SessionOrder::Provider, ["c", "d", "a", "b"]),
+            (SessionOrder::Location, ["c", "b", "a", "d"]),
+            (SessionOrder::Tokens, ["c", "a", "b", "d"]),
+        ] {
+            app.session_order = order;
+            app.filter();
+            let ids = app
+                .visible
+                .iter()
+                .map(|index| sessions[*index].id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[test]
     fn selected_provider_filters_sessions() {
         let session = |id: &str, provider: Provider| Session {
             provider,
             id: id.to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: None,
             updated_at: 0,
             first_user_message: "message".to_owned(),
@@ -1131,6 +1418,8 @@ mod tests {
             provider: Provider::OpenCode,
             id: "session-1".to_owned(),
             title: None,
+            model: Some("gpt-5.6-sol".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
             directory: None,
             updated_at: 0,
             first_user_message: "first".to_owned(),
@@ -1153,11 +1442,16 @@ mod tests {
         assert!(details.iter().any(|line| line == "Stats:"));
         assert!(details
             .iter()
-            .any(|line| line == "In 1,299,667  Out 171,958"));
+            .any(|line| line == "Model: gpt-5.6-sol - high"));
+        assert!(!details
+            .iter()
+            .any(|line| line.starts_with("Reasoning effort:")));
+        assert!(details
+            .iter()
+            .any(|line| line == "In 1,299,667  Out 171,958  Total 62,787,599"));
         assert!(details
             .iter()
             .any(|line| line == "Cache create 88,966  Cache read 61,227,008"));
-        assert!(details.iter().any(|line| line == "Total 62,787,599"));
 
         let meta = session_meta_line(&session, 80);
         assert_eq!(meta.width(), 80);
@@ -1166,7 +1460,7 @@ mod tests {
             Some(Color::Cyan)
         );
         assert!(meta.to_string().ends_with("62,787,599"));
-        assert!(meta.to_string().contains("directory unknown"));
+        assert_eq!(meta.to_string().chars().nth(22), Some('-'));
     }
 
     #[test]
@@ -1175,6 +1469,8 @@ mod tests {
             provider: Provider::Codex,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: Some(Path::new("/work/project").to_path_buf()),
             updated_at: 0,
             first_user_message: "first".to_owned(),
@@ -1189,11 +1485,13 @@ mod tests {
             }),
         };
 
-        let meta = session_meta_line(&session, 30).to_string();
+        let meta = session_meta_line(&session, 30);
+        let text = meta.to_string();
 
-        assert!(meta.starts_with("codex"));
-        assert!(meta.contains("work/project"));
-        assert!(!meta.ends_with("18,446,744,073,709,551,615"));
+        assert_eq!(meta.width(), 30);
+        assert!(text.starts_with("codex"));
+        assert!(text.contains("/wor..."));
+        assert!(!text.ends_with("18,446,744,073,709,551,615"));
     }
 
     #[test]
@@ -1253,6 +1551,8 @@ mod tests {
             provider: Provider::Codex,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: None,
             updated_at: 0,
             first_user_message: "auth migration".to_owned(),
@@ -1307,6 +1607,8 @@ mod tests {
             provider: Provider::Codex,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: None,
             updated_at: 0,
             first_user_message: "first".to_owned(),
@@ -1328,6 +1630,8 @@ mod tests {
             provider: Provider::Codex,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: None,
             updated_at: 0,
             first_user_message: "first".to_owned(),

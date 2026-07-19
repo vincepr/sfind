@@ -107,6 +107,8 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     let mut id = None;
     let mut title = None;
+    let mut model = None;
+    let mut reasoning_effort = None;
     let mut directory = None;
     let mut updated_at = 0;
     let mut user_messages = Vec::new();
@@ -137,6 +139,12 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
         let Some(payload) = value.get("payload") else {
             continue;
         };
+        if let Some(record_model) = usage_model(payload) {
+            model = Some(record_model.to_owned());
+        }
+        if let Some(record_effort) = reasoning_effort_setting(payload) {
+            reasoning_effort = Some(record_effort.to_owned());
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
                 if id.is_none() {
@@ -218,6 +226,8 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
                 provider: Provider::Codex,
                 id,
                 title,
+                model,
+                reasoning_effort,
                 directory,
                 updated_at,
             },
@@ -226,6 +236,31 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
             usage,
         )
     }))
+}
+
+fn usage_model(value: &Value) -> Option<&str> {
+    value
+        .get("model")
+        .or_else(|| value.get("model_name"))
+        .or_else(|| value.get("to_model"))
+        .or_else(|| {
+            value
+                .get("metadata")
+                .and_then(|metadata| metadata.get("model"))
+        })
+        .and_then(Value::as_str)
+}
+
+fn reasoning_effort_setting(value: &Value) -> Option<&str> {
+    value
+        .get("effort")
+        .or_else(|| value.get("reasoning_effort"))
+        .or_else(|| {
+            value
+                .get("thread_settings")
+                .and_then(|settings| settings.get("reasoning_effort"))
+        })
+        .and_then(Value::as_str)
 }
 
 fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
@@ -300,6 +335,8 @@ mod tests {
                 "\n",
                 r#"{"timestamp":"2026-01-01T10:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The login flow is fixed."}]}}"#,
                 "\n",
+                r#"{"timestamp":"2026-01-01T10:03:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}}"#,
+                "\n",
                 r#"{"timestamp":"2026-01-01T10:03:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_creation_input_tokens":10,"output_tokens":20},"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"cache_creation_input_tokens":10,"output_tokens":20}}}}"#,
                 "\n",
                 r#"{"timestamp":"2026-01-01T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":80,"cache_creation_input_tokens":15,"output_tokens":30}}}}"#,
@@ -309,6 +346,10 @@ mod tests {
                 r#"{"timestamp":"2026-01-01T10:03:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
                 "\n",
                 r#"{"timestamp":"2026-01-01T10:03:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160,"cached_input_tokens":80,"cache_creation_input_tokens":15,"output_tokens":32}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:06Z","type":"event_msg","payload":{"type":"model_reroute","to_model":"gpt-5.7"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-01-01T10:03:07Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"reasoning_effort":"xhigh"}}}"#,
                 "\n"
             ),
         )
@@ -320,6 +361,8 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "codex-1");
         assert_eq!(sessions[0].title.as_deref(), Some("Auth cleanup"));
+        assert_eq!(sessions[0].model.as_deref(), Some("gpt-5.7"));
+        assert_eq!(sessions[0].reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(sessions[0].user_messages, ["Fix the login flow"]);
         let usage = sessions[0].usage.expect("Codex token usage");
         assert_eq!(usage.input_tokens, 65);

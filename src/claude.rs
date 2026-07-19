@@ -51,6 +51,7 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
         .and_then(|stem| stem.to_str())
         .map(str::to_owned);
     let mut title = None;
+    let mut model = None;
     let mut directory = None;
     let mut updated_at = 0;
     let mut user_messages = Vec::new();
@@ -98,6 +99,9 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
             .get("content")
             .and_then(|content| text_blocks(content, &["text"]));
         if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(message_model) = message.get("model").and_then(Value::as_str) {
+                model = Some(message_model.to_owned());
+            }
             if let Some(message_usage) = message_usage(message) {
                 if let Some(message_id) = message.get("id").and_then(Value::as_str) {
                     let request_id = value
@@ -132,6 +136,8 @@ fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {
                 provider: Provider::Claude,
                 id,
                 title,
+                model,
+                reasoning_effort: None,
                 directory,
                 updated_at,
             },
@@ -178,11 +184,11 @@ mod tests {
                 "\n",
                 r#"{"type":"user","sessionId":"claude-1","timestamp":"2026-01-02T10:02:00Z","message":{"role":"user","content":[{"type":"tool_result","content":"private tool result"}]}}"#,
                 "\n",
-                r#"{"type":"assistant","sessionId":"claude-1","requestId":"req_1","timestamp":"2026-01-02T10:03:00Z","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":50},"content":[{"type":"text","text":"Here is the plan."}]}}"#,
+                r#"{"type":"assistant","sessionId":"claude-1","requestId":"req_1","timestamp":"2026-01-02T10:03:00Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":100,"output_tokens":25,"cache_creation_input_tokens":10,"cache_read_input_tokens":50},"content":[{"type":"text","text":"Here is the plan."}]}}"#,
                 "\n",
-                r#"{"type":"assistant","sessionId":"claude-1","requestId":"req_1","timestamp":"2026-01-02T10:03:01Z","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":100,"output_tokens":30,"cache_creation_input_tokens":10,"cache_read_input_tokens":50},"content":[]}}"#,
+                r#"{"type":"assistant","sessionId":"claude-1","requestId":"req_1","timestamp":"2026-01-02T10:03:01Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":100,"output_tokens":30,"cache_creation_input_tokens":10,"cache_read_input_tokens":50},"content":[]}}"#,
                 "\n",
-                r#"{"type":"assistant","sessionId":"claude-1","requestId":"req_2","timestamp":"2026-01-02T10:03:02Z","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5},"content":[]}}"#,
+                r#"{"type":"assistant","sessionId":"claude-1","requestId":"req_2","timestamp":"2026-01-02T10:03:02Z","message":{"id":"msg_1","role":"assistant","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5},"content":[]}}"#,
                 "\nnot json",
                 "\n"
             ),
@@ -194,6 +200,8 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title.as_deref(), Some("Database migration"));
+        assert_eq!(sessions[0].model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(sessions[0].reasoning_effort, None);
         assert_eq!(sessions[0].user_messages, ["Plan the migration"]);
         let usage = sessions[0].usage.expect("Claude token usage");
         assert_eq!(usage.input_tokens, 110);

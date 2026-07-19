@@ -13,7 +13,9 @@ use crate::{
 struct OpenCodeSession {
     id: String,
     title: String,
-    directory: PathBuf,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    directory: Option<PathBuf>,
     updated_at: i64,
     user_messages: Vec<String>,
     last_assistant_message: Option<String>,
@@ -71,7 +73,9 @@ pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
             current = Some(OpenCodeSession {
                 id,
                 title: title.unwrap_or_default(),
-                directory: directory.map(PathBuf::from).unwrap_or_default(),
+                model: None,
+                reasoning_effort: None,
+                directory: directory.map(PathBuf::from),
                 updated_at: updated_at.unwrap_or_default(),
                 user_messages: Vec::new(),
                 last_assistant_message: None,
@@ -97,6 +101,12 @@ pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
             if let Some(message_data) = message_data.as_deref() {
                 match serde_json::from_str::<Value>(message_data) {
                     Ok(message) => {
+                        if let Some(model) = message_model(&message) {
+                            session.model = Some(model.to_owned());
+                        }
+                        if let Some(effort) = message_reasoning_effort(&message) {
+                            session.reasoning_effort = Some(effort.to_owned());
+                        }
                         session.message_role = message
                             .get("role")
                             .and_then(Value::as_str)
@@ -164,7 +174,9 @@ fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) 
             provider: Provider::OpenCode,
             id: session.id,
             title: Some(session.title),
-            directory: Some(session.directory),
+            model: session.model,
+            reasoning_effort: session.reasoning_effort,
+            directory: session.directory,
             updated_at: session.updated_at,
         },
         session.user_messages,
@@ -173,6 +185,20 @@ fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) 
     ) {
         sessions.push(session);
     }
+}
+
+fn message_model(message: &Value) -> Option<&str> {
+    message
+        .get("modelID")
+        .or_else(|| message.get("model").and_then(|model| model.get("modelID")))
+        .and_then(Value::as_str)
+}
+
+fn message_reasoning_effort(message: &Value) -> Option<&str> {
+    message
+        .get("variant")
+        .or_else(|| message.get("model").and_then(|model| model.get("variant")))
+        .and_then(Value::as_str)
 }
 
 fn message_usage(message: &Value) -> Option<TokenUsage> {
@@ -269,7 +295,7 @@ mod tests {
                     "msg_2",
                     "ses_1",
                     200,
-                    r#"{"role":"assistant","tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":30,"write":10}}}"#
+                    r#"{"role":"assistant","modelID":"gpt-5.6-sol","variant":"high","tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":30,"write":10}}}"#
                 ],
             )
             .expect("assistant message");
@@ -291,6 +317,17 @@ mod tests {
         }
         connection
             .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "msg_3",
+                    "ses_1",
+                    300,
+                    r#"{"role":"user","model":{"modelID":"next-model","variant":"xhigh"}}"#
+                ],
+            )
+            .expect("pending user message");
+        connection
+            .execute(
                 "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5)",
                 params!["ses_child", "Subagent", "/work/api", 2000, "ses_1"],
             )
@@ -302,6 +339,8 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].user_messages, ["Fix API auth"]);
         assert_eq!(sessions[0].title.as_deref(), Some("API cleanup"));
+        assert_eq!(sessions[0].model.as_deref(), Some("next-model"));
+        assert_eq!(sessions[0].reasoning_effort.as_deref(), Some("xhigh"));
         let usage = sessions[0].usage.expect("OpenCode token usage");
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 25);
@@ -331,17 +370,33 @@ mod tests {
                 INSERT INTO session VALUES ('ses_1', 'Title', '/work', 1000, NULL);
                 INSERT INTO message VALUES ('msg_1', 'ses_1', 100, '{\"role\":\"user\"}');
                 INSERT INTO part VALUES ('part_1', 'msg_1', 101, 'not json');
-                INSERT INTO part VALUES (
-                    'part_2', 'msg_1', 102, '{\"type\":\"text\",\"text\":\"Valid request\"}'
-                );",
+                 INSERT INTO part VALUES (
+                     'part_2', 'msg_1', 102, '{\"type\":\"text\",\"text\":\"Valid request\"}'
+                 );
+                 INSERT INTO session VALUES ('ses_2', 'No directory', NULL, 2000, NULL);
+                 INSERT INTO message VALUES ('msg_2', 'ses_2', 200, '{\"role\":\"user\"}');
+                 INSERT INTO part VALUES (
+                     'part_3', 'msg_2', 201, '{\"type\":\"text\",\"text\":\"Other request\"}'
+                 );",
             )
             .expect("fixture database");
         drop(connection);
 
         let discovery = load(&path).expect("load sessions");
 
-        assert_eq!(discovery.sessions.len(), 1);
-        assert_eq!(discovery.sessions[0].user_messages, ["Valid request"]);
+        assert_eq!(discovery.sessions.len(), 2);
+        let valid = discovery
+            .sessions
+            .iter()
+            .find(|session| session.id == "ses_1")
+            .expect("valid session");
+        assert_eq!(valid.user_messages, ["Valid request"]);
+        let without_directory = discovery
+            .sessions
+            .iter()
+            .find(|session| session.id == "ses_2")
+            .expect("session without directory");
+        assert_eq!(without_directory.directory, None);
         assert_eq!(discovery.warnings.len(), 1);
         assert!(discovery.warnings[0].contains("1 malformed database record"));
         assert!(!discovery.warnings[0].contains("not json"));

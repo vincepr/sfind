@@ -12,13 +12,17 @@ Sessions are ordered by latest activity. Type to fuzzy-filter directories, provi
 summaries, and user-authored messages. Directory matches rank ahead of message-only matches. Select
 with the arrow keys or mouse, inspect the first and latest sent
 messages, latest received message, and available input, output, and cache token counters, then press
-Enter to resume the session in its owning CLI.
+Enter to resume the session in its owning CLI. The Stats section shows the latest model and
+reasoning-effort setting recorded by the provider on one line; unavailable values are shown as `-`.
 Session rows show their total token count at the right edge when space permits. On narrow terminals,
 the session list is placed above the details instead of beside it.
 
 Use the range button in the top-right to cycle through all sessions, today, or the last 3, 7, or
 30 local calendar days. `All` is selected by default. The CLI button beside it cycles through all
-providers, Codex, OpenCode (`open`), and Claude.
+providers, Codex, OpenCode (`open`), and Claude. Click the session-list top border above the
+provider, date, location, or total-token column to order by it; a downward triangle marks the active
+column. Provider and location sort alphabetically, total tokens sort largest-first, and non-date
+orders use newest date as their tie-breaker. The matching-session count is on the bottom-right border.
 
 Press `Ctrl-P` to close the finder and print a safely quoted command that changes to the project
 directory and resumes the selected session. The command is printed but not executed. Press

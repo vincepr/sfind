@@ -104,6 +104,10 @@ pub struct Session {
     pub id: String,
     /// Provider-generated title or summary, when available.
     pub title: Option<String>,
+    /// Most recently recorded model identifier, when available.
+    pub model: Option<String>,
+    /// Most recently recorded reasoning-effort setting, when available.
+    pub reasoning_effort: Option<String>,
     /// Working directory associated with the session.
     pub directory: Option<PathBuf>,
     /// Last activity time as Unix milliseconds.
@@ -418,6 +422,8 @@ struct SessionHeader {
     provider: Provider,
     id: String,
     title: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
     directory: Option<PathBuf>,
     updated_at: i64,
 }
@@ -432,6 +438,8 @@ fn finish_session(
         provider: header.provider,
         id: header.id,
         title: header.title.and_then(|value| normalized_text(&value)),
+        model: header.model,
+        reasoning_effort: header.reasoning_effort,
         directory: header.directory,
         updated_at: header.updated_at,
         first_user_message: user_messages.first()?.clone(),
@@ -466,6 +474,8 @@ mod tests {
                 provider,
                 id: "session-1".to_owned(),
                 title: None,
+                model: None,
+                reasoning_effort: None,
                 directory: Some(PathBuf::from(".")),
                 updated_at: 0,
                 first_user_message: "first".to_owned(),
@@ -488,6 +498,8 @@ mod tests {
             provider: Provider::Claude,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: Some(PathBuf::from("/path/that/does/not/exist")),
             updated_at: 0,
             first_user_message: "first".to_owned(),
@@ -512,6 +524,8 @@ mod tests {
             provider: Provider::Codex,
             id: "session'1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: Some(PathBuf::from("/work/project's app")),
             updated_at: 0,
             first_user_message: "first".to_owned(),
@@ -538,6 +552,8 @@ mod tests {
             provider: Provider::Claude,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: Some(PathBuf::from(OsString::from_vec(
                 b"/work/invalid-\xff".to_vec(),
             ))),
@@ -574,6 +590,8 @@ mod tests {
                 provider,
                 id: "session-1".to_owned(),
                 title: None,
+                model: None,
+                reasoning_effort: None,
                 directory: None,
                 updated_at: 0,
                 first_user_message: "first".to_owned(),
@@ -596,6 +614,8 @@ mod tests {
             provider: Provider::Codex,
             id: "session-1".to_owned(),
             title: None,
+            model: None,
+            reasoning_effort: None,
             directory: None,
             updated_at: 0,
             first_user_message: "first".to_owned(),
