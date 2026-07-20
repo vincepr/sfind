@@ -2,15 +2,18 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::{
-    add_usage, finish_session, text_blocks, timestamp_millis, Provider, ProviderDiscovery, Session,
-    SessionHeader, TokenUsage,
+use crate::session::{
+    add_usage, finish_session, text_blocks, timestamp_millis, Provider, Session, SessionHeader,
+    TokenUsage,
 };
+
+use super::{shell_quote, ProviderDiscovery, SessionAction};
 
 pub(crate) fn load(root: &Path) -> Result<ProviderDiscovery> {
     if !root.exists() {
@@ -42,6 +45,26 @@ pub(crate) fn load(root: &Path) -> Result<ProviderDiscovery> {
         }
     }
     Ok(discovery)
+}
+
+pub(super) fn session_process(session: &Session, action: SessionAction) -> Command {
+    let mut command = Command::new("claude");
+    command.arg("--resume").arg(&session.id);
+    if action == SessionAction::Fork {
+        command.arg("--fork-session");
+    }
+    if let Some(directory) = session.directory.as_ref().filter(|path| path.is_dir()) {
+        command.current_dir(directory);
+    }
+    command
+}
+
+pub(super) fn printable_session_command(session: &Session, action: SessionAction) -> String {
+    let fork = match action {
+        SessionAction::Resume => "",
+        SessionAction::Fork => " --fork-session",
+    };
+    format!("claude --resume {}{fork}", shell_quote(&session.id))
 }
 
 fn parse(path: &Path, warnings: &mut Vec<String>) -> Result<Option<Session>> {

@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use crate::{
-    add_usage, finish_session, normalized_text, Provider, ProviderDiscovery, Session,
-    SessionHeader, TokenUsage,
+use crate::session::{
+    add_usage, finish_session, normalized_text, Provider, Session, SessionHeader, TokenUsage,
 };
+
+use super::{shell_quote, ProviderDiscovery, SessionAction};
 
 #[derive(Debug)]
 struct OpenCodeSession {
@@ -163,6 +165,26 @@ pub(crate) fn load(path: &Path) -> Result<ProviderDiscovery> {
         ));
     }
     Ok(discovery)
+}
+
+pub(super) fn session_process(session: &Session, action: SessionAction) -> Command {
+    let mut command = Command::new("opencode");
+    command.arg("--session").arg(&session.id);
+    if action == SessionAction::Fork {
+        command.arg("--fork");
+    }
+    if let Some(directory) = session.directory.as_ref().filter(|path| path.is_dir()) {
+        command.arg(directory);
+    }
+    command
+}
+
+pub(super) fn printable_session_command(session: &Session, action: SessionAction) -> String {
+    let fork = match action {
+        SessionAction::Resume => "",
+        SessionAction::Fork => " --fork",
+    };
+    format!("opencode --session {}{fork}", shell_quote(&session.id))
 }
 
 fn push_finished(sessions: &mut Vec<Session>, session: Option<OpenCodeSession>) {
