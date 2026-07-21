@@ -1101,7 +1101,7 @@ fn provider_color(provider: &str) -> Color {
     match provider {
         "codex" => Color::Green,
         "opencode" => Color::Cyan,
-        "claude" => Color::Magenta,
+        "claude" => Color::Yellow,
         _ => Color::White,
     }
 }
@@ -1210,9 +1210,9 @@ mod tests {
         delete_last_word, detail_cutoffs, detail_lines, directory_color, filter_width, fuzzy_match,
         list_column_widths, list_index_at, list_item_capacity, list_sort_areas,
         list_title_capacity, list_viewport, modifier_areas, next_day_range, next_provider_filter,
-        padded_label, pane_direction, provider_short_label, search_cursor, search_rank,
-        search_scroll, session_list_block, session_meta_line, session_order_index, sort_order_at,
-        truncate, truncate_middle, App, DayRange, Selection, SessionOrder,
+        padded_label, pane_direction, provider_color, provider_short_label, search_cursor,
+        search_rank, search_scroll, session_list_block, session_meta_line, session_order_index,
+        sort_order_at, truncate, truncate_middle, App, DayRange, Selection, SessionOrder,
     };
 
     #[test]
@@ -1742,6 +1742,11 @@ mod tests {
         let second = directory_color(Some(Path::new("/work/api")));
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn claude_uses_a_high_contrast_provider_color() {
+        assert_eq!(provider_color("claude"), Color::Yellow);
     }
 
     #[test]
